@@ -18,7 +18,7 @@ def _get_version() -> str:
                 return f"v{f.read().strip()}"
         except Exception:
             pass
-    return "v1.5.6"
+    return "v1.8.0"
 
 
 # 导航项定义： (id, 图标emoji, 标签)
@@ -63,8 +63,8 @@ class Sidebar(QWidget):
 
         # 分隔线
         sep = QFrame()
+        sep.setObjectName("sidebar_sep")
         sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("background-color: rgba(255,255,255,0.06); max-height: 1px; margin: 8px 16px;")
         layout.addWidget(sep)
 
         # 导航按钮

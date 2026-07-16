@@ -57,7 +57,7 @@ class CheckinManager:
                     # 联动更新上游 Key 池（用 API Key 或 auth_token 匹配）
                     try:
                         from .proxy_server import ProxyDatabase
-                        db = ProxyDatabase()
+                        db = ProxyDatabase.get_instance()
                         # 优先用 API Key 匹配，其次用 auth_token
                         match_key = account.api_key if (account.api_key and account.api_key.startswith("ck_")) else account.auth_token
                         db.sync_quota_to_key(

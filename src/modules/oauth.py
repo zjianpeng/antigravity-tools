@@ -20,6 +20,7 @@ import base64
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 import subprocess
@@ -29,16 +30,29 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-# === 路径常量 ===
-USER_PROFILE = os.path.expanduser("~")
-APPDATA = os.environ.get("APPDATA", os.path.join(USER_PROFILE, "AppData", "Roaming"))
-LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.join(USER_PROFILE, "AppData", "Local"))
+# === 平台检测 ===
+IS_MACOS = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
 
-WORKBUDDY_HOME = os.path.join(USER_PROFILE, ".workbuddy")
-WORKBUDDY_ROAMING = os.path.join(APPDATA, "WorkBuddy")
+# === 路径常量（跨平台）===
+USER_PROFILE = os.path.expanduser("~")
+
+if IS_MACOS:
+    APPDATA = os.path.join(USER_PROFILE, "Library", "Application Support")
+    LOCALAPPDATA = APPDATA
+    WORKBUDDY_HOME = os.path.join(USER_PROFILE, ".workbuddy")
+    WORKBUDDY_ROAMING = os.path.join(APPDATA, "WorkBuddy")
+    CODEBUDDY_EXT_AUTH_DIR = os.path.join(APPDATA, "CodeBuddyExtension", "Data", "Public", "auth")
+    WORKBUDDY_EXE = "/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy"
+else:
+    APPDATA = os.environ.get("APPDATA", os.path.join(USER_PROFILE, "AppData", "Roaming"))
+    LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.join(USER_PROFILE, "AppData", "Local"))
+    WORKBUDDY_HOME = os.path.join(USER_PROFILE, ".workbuddy")
+    WORKBUDDY_ROAMING = os.path.join(APPDATA, "WorkBuddy")
+    CODEBUDDY_EXT_AUTH_DIR = os.path.join(LOCALAPPDATA, "CodeBuddyExtension", "Data", "Public", "auth")
+    WORKBUDDY_EXE = os.path.join(LOCALAPPDATA, "Programs", "WorkBuddy", "WorkBuddy.exe")
 
 # 新版认证文件（优先读取）
-CODEBUDDY_EXT_AUTH_DIR = os.path.join(LOCALAPPDATA, "CodeBuddyExtension", "Data", "Public", "auth")
 WORKBUDDY_DESKTOP_INFO = os.path.join(CODEBUDDY_EXT_AUTH_DIR, "workbuddy-desktop.info")
 
 # 旧版认证文件（兼容回退）
@@ -49,7 +63,7 @@ STATE_VSCDB = os.path.join(WORKBUDDY_ROAMING, "User", "globalStorage", "state.vs
 STATE_VSCDB_BACKUP = os.path.join(WORKBUDDY_ROAMING, "User", "globalStorage", "state.vscdb.backup")
 WORKBUDDY_DB = os.path.join(WORKBUDDY_HOME, "workbuddy.db")
 SESSIONS_VSCDB = os.path.join(WORKBUDDY_ROAMING, "codebuddy-sessions.vscdb")
-WORKBUDDY_EXE = os.path.join(LOCALAPPDATA, "Programs", "WorkBuddy", "WorkBuddy.exe")
+# WORKBUDDY_EXE 已在上方跨平台定义
 
 # state.vscdb 中的 AccessToken key（旧版）
 ACCESS_TOKEN_SECRET_KEY = (
@@ -106,17 +120,24 @@ def decode_jwt(token: str) -> dict:
 
 
 class WorkBuddyProcess:
-    """WorkBuddy 进程管理"""
+    """WorkBuddy 进程管理（跨平台）"""
 
-    PROCESS_NAME = "WorkBuddy.exe"
+    PROCESS_NAME = "WorkBuddy"  # macOS: "WorkBuddy", Windows: "WorkBuddy.exe"
 
     @staticmethod
     def is_running() -> bool:
         try:
-            result = subprocess.run(
-                ["tasklist"], capture_output=True, text=True, timeout=5,
-            )
-            return WorkBuddyProcess.PROCESS_NAME in result.stdout
+            if IS_MACOS:
+                result = subprocess.run(
+                    ["pgrep", "-x", "WorkBuddy"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return result.returncode == 0
+            else:
+                result = subprocess.run(
+                    ["tasklist"], capture_output=True, text=True, timeout=5,
+                )
+                return "WorkBuddy.exe" in result.stdout
         except Exception:
             return False
 
@@ -124,21 +145,28 @@ class WorkBuddyProcess:
     def kill() -> bool:
         """终止 WorkBuddy 进程（先优雅，再强制）"""
         try:
-            # 先尝试优雅关闭
-            subprocess.run(
-                ["taskkill", "/IM", WorkBuddyProcess.PROCESS_NAME],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(2)
-
-            # 检查是否还在运行，强制终止
-            if WorkBuddyProcess.is_running():
-                logger.info("WorkBuddy 未响应优雅关闭，强制终止...")
+            if IS_MACOS:
+                # macOS: 先 SIGTERM
+                subprocess.run(["pkill", "-x", "WorkBuddy"], capture_output=True, timeout=5)
+                time.sleep(2)
+                if WorkBuddyProcess.is_running():
+                    logger.info("WorkBuddy 未响应优雅关闭，强制终止...")
+                    subprocess.run(["pkill", "-9", "-x", "WorkBuddy"], capture_output=True, timeout=5)
+                    time.sleep(2)
+            else:
+                # Windows: taskkill
                 subprocess.run(
-                    ["taskkill", "/F", "/IM", WorkBuddyProcess.PROCESS_NAME],
+                    ["taskkill", "/IM", "WorkBuddy.exe"],
                     capture_output=True, timeout=5,
                 )
                 time.sleep(2)
+                if WorkBuddyProcess.is_running():
+                    logger.info("WorkBuddy 未响应优雅关闭，强制终止...")
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "WorkBuddy.exe"],
+                        capture_output=True, timeout=5,
+                    )
+                    time.sleep(2)
 
             if WorkBuddyProcess.is_running():
                 logger.error("无法终止 WorkBuddy 进程")
@@ -153,15 +181,28 @@ class WorkBuddyProcess:
     @staticmethod
     def start() -> bool:
         """启动 WorkBuddy"""
-        if not os.path.exists(WORKBUDDY_EXE):
-            logger.error(f"WorkBuddy 未安装: {WORKBUDDY_EXE}")
-            return False
+        exe_path = WORKBUDDY_EXE
+        if IS_MACOS:
+            exe_path = "/Applications/WorkBuddy.app"
+            if not os.path.exists(exe_path):
+                logger.error(f"WorkBuddy 未安装: {exe_path}")
+                return False
+        else:
+            if not os.path.exists(exe_path):
+                logger.error(f"WorkBuddy 未安装: {exe_path}")
+                return False
         try:
-            subprocess.Popen(
-                [WORKBUDDY_EXE],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
+            if IS_MACOS:
+                subprocess.Popen(
+                    ["open", "-a", "WorkBuddy"],
+                    close_fds=True,
+                )
+            else:
+                subprocess.Popen(
+                    [exe_path],
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                )
             logger.info("WorkBuddy 已启动")
             return True
         except Exception as e:
@@ -441,13 +482,11 @@ class WorkBuddyAuth:
 # ============================================================
 
 def _decrypt_vscdb_secret(blob: bytes) -> dict:
-    """解密 state.vscdb 中的 secret 条目
+    """解密 state.vscdb 中的 secret 条目（跨平台）
 
-    加解密链路：
-    1. Local State -> os_crypt.encrypted_key -> Base64 解码 -> 去掉 DPAPI 前缀 -> CryptUnprotectData -> master_key
-    2. state.vscdb Buffer -> 去掉 v10 前缀(3 bytes) -> nonce(12 bytes) + ciphertext+tag -> AESGCM(master_key).decrypt
+    Windows: DPAPI + AESGCM
+    macOS: Keychain + AESGCM
     """
-    import win32crypt
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     # 1. 获取 master key
@@ -462,10 +501,34 @@ def _decrypt_vscdb_secret(blob: bytes) -> dict:
         raise RuntimeError("Local State 中未找到 os_crypt.encrypted_key")
 
     encrypted_key = base64.b64decode(encrypted_key_b64)
-    if encrypted_key[:5] != b"DPAPI":
-        raise RuntimeError("encrypted_key 格式异常，缺少 DPAPI 前缀")
 
-    master_key = win32crypt.CryptUnprotectData(encrypted_key[5:], None, None, None, 0)[1]
+    if IS_MACOS:
+        # macOS: 前 3 字节是 "v11" 前缀，后面是 Keychain 加密的 key
+        # 但实际上 macOS Electron 用的是 Keychain Access，不经过 DPAPI
+        # 这里需要用 security 命令解密，或直接用 PyObjC
+        # 简化实现：对于 macOS，WorkBuddy 使用新版 workbuddy-desktop.info，
+        # 不需要走 vscdb 解密路径
+        import subprocess as _sp
+        # 尝试用 security 命令解密（Electron macOS 标准做法）
+        encrypted_key_data = encrypted_key  # 包含 "v11" 前缀
+        try:
+            result = _sp.run(
+                ["security", "find-generic-password",
+                 "-s", "WorkBuddy", "-a", "WorkBuddy", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                master_key = base64.b64decode(result.stdout.strip())
+            else:
+                raise RuntimeError("无法从 Keychain 获取 master key")
+        except Exception as e:
+            raise RuntimeError(f"macOS Keychain 解密失败: {e}")
+    else:
+        # Windows: DPAPI
+        if encrypted_key[:5] != b"DPAPI":
+            raise RuntimeError("encrypted_key 格式异常，缺少 DPAPI 前缀")
+        import win32crypt
+        master_key = win32crypt.CryptUnprotectData(encrypted_key[5:], None, None, None, 0)[1]
 
     # 2. 解密 blob
     if blob[:3] != b"v10":

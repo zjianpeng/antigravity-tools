@@ -8,7 +8,7 @@ from typing import Optional
 
 from ..models import (
     Account, Platform, AccountStatus, PlanType,
-    CheckinInfo, QuotaInfo, Fingerprint, ApiKey, AppSettings, ProxyConfig
+    CheckinInfo, QuotaInfo,
 )
 
 DB_NAME = "antigravity.db"

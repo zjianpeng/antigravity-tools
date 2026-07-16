@@ -244,7 +244,7 @@ class AccountQuotaCard(QFrame):
             self._total_label.setText(
                 f"💎 总积分: {remaining_credits:.0f} / {total_credits:.0f}"
             )
-            self._total_label.setStyleSheet("font-size: 14px; font-weight: 600; color: #2D3748;")
+            self._total_label.setStyleSheet("font-size: 14px; font-weight: 600;")
 
             # 清空旧的资源包卡片
             while self._packages_layout.count():
@@ -269,7 +269,7 @@ class AccountQuotaCard(QFrame):
 
             # 联动更新上游 Key 池：同步积分、自动禁用/恢复
             try:
-                db = ProxyDatabase()
+                db = ProxyDatabase.get_instance()
                 # 优先用 API Key 匹配，其次用 auth_token
                 match_key = self._account.api_key if (self._account.api_key and self._account.api_key.startswith("ck_")) else self._account.auth_token
                 db.sync_quota_to_key(

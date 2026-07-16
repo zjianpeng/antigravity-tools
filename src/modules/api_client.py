@@ -23,6 +23,8 @@ API 响应格式：
 
 import json
 import logging
+import random
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -56,6 +58,161 @@ PUBLIC_API_PATHS = {
 # Keycloak token refresh 端点
 KEYCLOAK_TOKEN_URL = "https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/token"
 KEYCLOAK_CLIENT_ID = "console"
+
+
+def _retry_delay(attempt: int) -> float:
+    """Short jittered backoff for WorkBuddy APIs."""
+    return min(0.6 * (2 ** (attempt - 1)), 3.0) + random.uniform(0, 0.35)
+
+
+def _safe_response_text(resp: requests.Response, limit: int = 1000) -> str:
+    try:
+        return resp.text[:limit]
+    except Exception:
+        return ""
+
+
+def check_api_key_chat_status(api_key: str, attempts: int = 3) -> dict:
+    """Probe whether a WorkBuddy API key can start a chat request.
+
+    Returns:
+        {
+            "success": bool,
+            "status_text": str,
+            "flag": "abnormal" | None,
+            "http_status": int | None,
+            "body": str,
+        }
+    """
+    url = "https://copilot.tencent.com/v2/chat/completions"
+    payload = {
+        "model": "auto",
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": f"Bearer {api_key}",
+    }
+    transient_statuses = {408, 500, 502, 503, 504}
+    last_error = ""
+
+    with requests.Session() as session:
+        session.trust_env = False
+        session.proxies = {"http": None, "https": None}
+
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=(10, 30),
+                    stream=True,
+                ) as resp:
+                    status = resp.status_code
+                    if status == 200:
+                        return {
+                            "success": True,
+                            "status_text": "正常",
+                            "flag": None,
+                            "http_status": status,
+                            "body": "",
+                        }
+
+                    body = _safe_response_text(resp)
+                    if status == 403 and '"code":11140' in body:
+                        return {
+                            "success": False,
+                            "status_text": "风控异常",
+                            "flag": "abnormal",
+                            "http_status": status,
+                            "body": body,
+                        }
+                    if status == 401 and "invalid_secret" in body:
+                        return {
+                            "success": False,
+                            "status_text": "限流(401)",
+                            "flag": "rate_limited",
+                            "http_status": status,
+                            "body": body,
+                        }
+                    if status == 429:
+                        return {
+                            "success": True,
+                            "status_text": "限流(正常)",
+                            "flag": None,
+                            "http_status": status,
+                            "body": body,
+                        }
+                    if status == 401:
+                        # 401 但非 invalid_secret：也视为系统限流，标记 rate_limited
+                        return {
+                            "success": False,
+                            "status_text": "限流(401)",
+                            "flag": "rate_limited",
+                            "http_status": status,
+                            "body": body,
+                        }
+
+                    last_error = f"HTTP {status}: {body[:300]}"
+                    if status in transient_statuses and attempt < attempts:
+                        logger.warning(
+                            "Key 状态检测临时失败，第 %s/%s 次重试: %s",
+                            attempt,
+                            attempts,
+                            last_error,
+                        )
+                        time.sleep(_retry_delay(attempt))
+                        continue
+
+                    return {
+                        "success": False,
+                        "status_text": f"HTTP {status}",
+                        "flag": None,
+                        "http_status": status,
+                        "body": body,
+                    }
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_error = str(e)
+                if attempt < attempts:
+                    logger.warning(
+                        "Key 状态检测网络失败，第 %s/%s 次重试: %s",
+                        attempt,
+                        attempts,
+                        e,
+                    )
+                    time.sleep(_retry_delay(attempt))
+                    continue
+                return {
+                    "success": False,
+                    "status_text": f"异常: {e}",
+                    "flag": None,
+                    "http_status": None,
+                    "body": last_error,
+                }
+            except requests.RequestException as e:
+                last_error = str(e)
+                logger.warning("Key 状态检测请求失败: %s", e)
+                return {
+                    "success": False,
+                    "status_text": f"异常: {e}",
+                    "flag": None,
+                    "http_status": None,
+                    "body": last_error,
+                }
+
+    return {
+        "success": False,
+        "status_text": "检测失败",
+        "flag": None,
+        "http_status": None,
+        "body": last_error,
+    }
 
 
 class ApiClient:
@@ -165,60 +322,97 @@ class ApiClient:
         )
 
     def _billing_request(self, path: str, body: dict = None, retry_on_401: bool = True) -> Optional[dict]:
-        """发送计费 API 请求（POST 方法）
-
-        Args:
-            path: API 路径（如 /v2/billing/meter/get-user-resource）
-            body: 请求体（默认空 JSON）
-            retry_on_401: 401 时是否尝试刷新 token 后重试
-
-        Returns:
-            响应 JSON 或 None
-        """
+        """Send billing API request with short retries for transient upstream failures."""
         url = f"{BILLING_API_BASE}{path}"
-        try:
-            resp = self.session.post(url, json=body or {}, timeout=30)
+        transient_statuses = {408, 429, 500, 502, 503, 504}
+        max_attempts = 3
 
-            if not resp.ok:
-                # 非2xx响应：签到接口400+code=10001是正常的"已签到"，用warning级别
-                is_checkin_already = (resp.status_code == 400 and "daily-checkin" in path)
-                log_level = logging.WARNING if is_checkin_already else logging.ERROR
-                logger.log(log_level, f"API 非2xx响应 [POST {path}] status={resp.status_code} body={resp.text[:500]}")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.session.post(url, json=body or {}, timeout=(10, 30))
+                body_preview = _safe_response_text(resp, 500)
 
-                # 401 尝试刷新 token（仅 JWT 模式，API Key 模式无需刷新）
                 if resp.status_code == 401 and retry_on_401 and self.refresh_token and not self._is_api_key_mode:
-                    logger.info("收到 401，尝试刷新 token...")
+                    logger.info("收到 401，尝试刷新 token 后重试...")
                     if self._refresh_token():
                         self.session.headers["Authorization"] = f"Bearer {self.access_token}"
-                        resp = self.session.post(url, json=body or {}, timeout=30)
-                        if not resp.ok:
-                            logger.error(f"API 重试仍失败 [POST {path}] status={resp.status_code} body={resp.text[:500]}")
-                    else:
-                        logger.warning("Token 刷新失败")
-                        return None
+                        retry_on_401 = False
+                        continue
+                    logger.warning("Token 刷新失败")
+                    return None
 
-                # 非 2xx 时尝试解析 JSON 响应体（服务端可能返回业务错误码）
                 if not resp.ok:
+                    is_checkin_already = resp.status_code == 400 and "daily-checkin" in path
+                    log_level = logging.WARNING if is_checkin_already else logging.ERROR
+                    logger.log(
+                        log_level,
+                        "API 非 2xx 响应 [POST %s] attempt=%s/%s status=%s body=%s",
+                        path,
+                        attempt,
+                        max_attempts,
+                        resp.status_code,
+                        body_preview,
+                    )
+
+                    parsed = None
                     try:
-                        result = resp.json()
-                        # 返回 JSON 让调用方自行判断业务错误码
-                        logger.info(f"非2xx但可解析JSON [POST {path}] code={result.get('code')} msg={result.get('msg')}")
-                        return result
+                        parsed = resp.json()
                     except Exception:
-                        resp.raise_for_status()
-                        return None
+                        parsed = None
 
-            result = resp.json()
+                    if "daily-checkin" in path and parsed and parsed.get("code") == 10001:
+                        return parsed
 
-            if result.get("code") != 0:
-                logger.error(f"API 返回错误 [{path}]: code={result.get('code')}, msg={result.get('msg')}")
+                    business_code = parsed.get("code") if isinstance(parsed, dict) else None
+                    should_retry = resp.status_code in transient_statuses or business_code == 10000
+                    if should_retry and attempt < max_attempts:
+                        time.sleep(_retry_delay(attempt))
+                        continue
+
+                    if parsed:
+                        logger.info(
+                            "非 2xx JSON [POST %s] code=%s msg=%s",
+                            path,
+                            parsed.get("code"),
+                            parsed.get("msg"),
+                        )
+                    return None
+
+                result = resp.json()
+                if result.get("code") != 0:
+                    logger.error(
+                        "API 返回错误 [%s]: code=%s, msg=%s",
+                        path,
+                        result.get("code"),
+                        result.get("msg"),
+                    )
+                    if result.get("code") == 10000 and attempt < max_attempts:
+                        time.sleep(_retry_delay(attempt))
+                        continue
+                    return None
+
+                return result
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                logger.warning(
+                    "API 请求网络失败 [POST %s] attempt=%s/%s: %s",
+                    path,
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                if attempt < max_attempts:
+                    time.sleep(_retry_delay(attempt))
+                    continue
+                return None
+            except requests.RequestException as e:
+                logger.error(f"API 请求失败 [POST {path}]: {e}")
+                return None
+            except ValueError as e:
+                logger.error(f"API 响应不是 JSON [POST {path}]: {e}")
                 return None
 
-            return result
-
-        except requests.RequestException as e:
-            logger.error(f"API 请求失败 [POST {path}]: {e}")
-            return None
+        return None
 
     def _refresh_token(self) -> bool:
         """刷新 Keycloak access token
@@ -272,6 +466,11 @@ class ApiClient:
         result = self._billing_request(BILLING_API_PATHS["user_resource"])
         if not result:
             return {"success": False, "error": "请求失败"}
+
+        # ⚠️ 双重校验：code != 0 视为失败（防止上游 500 返回 {"code":10000} 被 truthy 判断通过）
+        if result.get("code") != 0:
+            logger.warning(f"[积分查询] 上游返回 code={result.get('code')}, msg={result.get('msg')}, 不更新积分")
+            return {"success": False, "error": f"上游错误: code={result.get('code')}"}
 
         try:
             response_data = result.get("data", {}).get("Response", {}).get("Data", {})

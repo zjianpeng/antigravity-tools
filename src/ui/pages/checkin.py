@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QTime
 
 from ...i18n import t
 from ...models import Account, Platform, AccountStatus
-from ...utils.store import load_accounts, save_account
+from ...utils.store import load_accounts, save_account, save_setting, load_setting
 from ...modules import CheckinManager
 from ...modules.api_client import ApiClient
 
@@ -64,7 +64,7 @@ class StatusRefreshWorker(QThread):
                         # 联动更新上游 Key 池（用 API Key 或 auth_token 匹配）
                         try:
                             from ...modules.proxy_server import ProxyDatabase
-                            db = ProxyDatabase()
+                            db = ProxyDatabase.get_instance()
                             match_key = account.api_key if (account.api_key and account.api_key.startswith("ck_")) else account.auth_token
                             db.sync_quota_to_key(
                                 api_key_or_token=match_key,
@@ -183,6 +183,8 @@ class CheckinPage(QWidget):
         self._is_checking = False
         self._current_page = 0    # 当前页码（0-based）
         self._timer_active = False  # 定时签到是否开启
+        self._sort_column = None
+        self._sort_order = Qt.AscendingOrder
         self._setup_ui()
 
         # 定时签到计时器 — 每秒检查一次是否到达设定时间
@@ -248,14 +250,17 @@ class CheckinPage(QWidget):
         for p in Platform:
             self._filter_combo.addItem(p.value, p)
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self._filter_combo)
+        self._filter_combo.setVisible(False)
 
         # 并发数设置
         toolbar.addWidget(QLabel("并发数:"))
         self._concurrency_spin = QSpinBox()
         self._concurrency_spin.setRange(1, 50)
-        self._concurrency_spin.setValue(5)
-        self._concurrency_spin.setToolTip("同时签到的线程数，建议5-10")
+        self._concurrency_spin.setValue(int(load_setting("checkin_concurrency", "5")))
+        self._concurrency_spin.setToolTip("同时请求线程数，范围 1-50")
+        self._concurrency_spin.valueChanged.connect(
+            lambda value: save_setting("checkin_concurrency", str(value))
+        )
         self._concurrency_spin.setFixedWidth(60)
         toolbar.addWidget(self._concurrency_spin)
 
@@ -272,8 +277,8 @@ class CheckinPage(QWidget):
         self._btn_stop = QPushButton("⏹ 停止")
         self._btn_stop.setObjectName("secondary_btn")
         self._btn_stop.setStyleSheet(
-            "QPushButton { color: #E53E3E; border: 1px solid #E53E3E; }"
-            "QPushButton:hover { background-color: #FED7D7; }"
+            "QPushButton { color: #FC8181; border: 1px solid #FC8181; }"
+            "QPushButton:hover { background-color: rgba(229,62,62,0.1); }"
         )
         self._btn_stop.setCursor(Qt.PointingHandCursor)
         self._btn_stop.setVisible(False)
@@ -315,7 +320,11 @@ class CheckinPage(QWidget):
         self._table.setHorizontalHeaderLabels([
             "账号", "平台", "签到状态", "今日积分", "本月积分"
         ])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_header_sort)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -358,12 +367,9 @@ class CheckinPage(QWidget):
 
         # 结果日志
         self._log_edit = QTextEdit()
+        self._log_edit.setObjectName("log_edit")
         self._log_edit.setReadOnly(True)
         self._log_edit.setMaximumHeight(150)
-        self._log_edit.setStyleSheet(
-            "QTextEdit { color: #9BA4B0; font-size: 12px; "
-            "background: #1A202C; border: 1px solid #2D3748; border-radius: 6px; padding: 8px; }"
-        )
         self._log_edit.setVisible(False)
         content_layout.addWidget(self._log_edit)
 
@@ -408,12 +414,42 @@ class CheckinPage(QWidget):
     # === 数据加载 & 渲染 ===
 
     def _load_accounts(self):
-        """加载全量账号（含筛选）"""
-        accounts = load_accounts()
-        platform = self._filter_combo.currentData()
-        if platform:
-            accounts = [a for a in accounts if a.platform == platform]
-        self._accounts = accounts
+        """加载全量账号"""
+        self._accounts = load_accounts()
+        self._apply_sort()
+
+    def _account_sort_value(self, account: Account, column: int):
+        if column == 0:
+            return account.display_name.lower()
+        if column == 1:
+            return account.platform.value
+        if column == 2:
+            return 0 if account.checkin.checked_today else 1
+        if column == 3:
+            return account.checkin.daily_credit if account.checkin.checked_today else 0
+        if column == 4:
+            return account.checkin.total_credits
+        return ""
+
+    def _apply_sort(self):
+        if self._sort_column is None:
+            return
+        reverse = self._sort_order == Qt.DescendingOrder
+        self._accounts.sort(
+            key=lambda account: self._account_sort_value(account, self._sort_column),
+            reverse=reverse,
+        )
+
+    def _on_header_sort(self, section: int):
+        if self._sort_column == section:
+            self._sort_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        else:
+            self._sort_column = section
+            self._sort_order = Qt.AscendingOrder
+        self._table.horizontalHeader().setSortIndicator(section, self._sort_order)
+        self._apply_sort()
+        self._current_page = 0
+        self._render_page()
 
     def _update_stats(self):
         """更新统计栏"""
@@ -628,8 +664,8 @@ class CheckinPage(QWidget):
         self._timer_active = True
         self._btn_timer.setText("关闭定时")
         self._btn_timer.setStyleSheet(
-            "QPushButton { color: #E53E3E; border: 1px solid #E53E3E; }"
-            "QPushButton:hover { background-color: #FED7D7; }"
+            "QPushButton { color: #FC8181; border: 1px solid #FC8181; }"
+            "QPushButton:hover { background-color: rgba(229,62,62,0.1); }"
         )
         self._time_edit.setEnabled(False)
         self._timer.start()

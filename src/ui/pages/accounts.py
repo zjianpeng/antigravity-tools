@@ -14,10 +14,10 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QAction, QCursor
 
 from ...i18n import t
-from ...models import Account, Platform, AccountStatus, PlanType, ResourcePackage
-from ...utils.store import load_accounts, save_account, delete_account
+from ...models import Account, Platform, AccountStatus, ResourcePackage
+from ...utils.store import load_accounts, save_account, delete_account, save_setting, load_setting
 from ...modules.oauth import WorkBuddyAuth
-from ...modules.api_client import ApiClient
+from ...modules.api_client import ApiClient, check_api_key_chat_status
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class AddAccountDialog(QDialog):
         self._platform_combo = QComboBox()
         for p in Platform:
             self._platform_combo.addItem(p.value, p)
-        layout.addRow("平台:", self._platform_combo)
+        self._platform_combo.setVisible(False)
 
         self._uid_input = QLineEdit()
         self._uid_input.setPlaceholderText("UID (自动检测)")
@@ -108,6 +108,12 @@ class AddAccountDialog(QDialog):
         btn_api.clicked.connect(self._import_from_api)
         btn_row3.addWidget(btn_api)
 
+        btn_card = QPushButton("卡密导入")
+        btn_card.setObjectName("secondary_btn")
+        btn_card.setToolTip("粘贴格式：昵称----apikey，一行一个")
+        btn_card.clicked.connect(self._import_card_keys)
+        btn_row3.addWidget(btn_card)
+
         layout.addRow(btn_row3)
 
         # 第四行按钮：保存 + 取消
@@ -119,6 +125,7 @@ class AddAccountDialog(QDialog):
         btn_row4.addWidget(btn_save)
 
         btn_cancel = QPushButton(t("common.cancel"))
+        btn_cancel.setObjectName("secondary_btn")
         btn_cancel.clicked.connect(self.reject)
         btn_row4.addWidget(btn_cancel)
 
@@ -390,8 +397,12 @@ class AddAccountDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
             parent=dialog
         )
-        buttons.button(QDialogButtonBox.Ok).setText("验证并导入")
-        buttons.button(QDialogButtonBox.Cancel).setText(t("common.cancel"))
+        btn_ok = buttons.button(QDialogButtonBox.Ok)
+        btn_ok.setText("验证并导入")
+        btn_ok.setObjectName("primary_btn")
+        btn_cancel = buttons.button(QDialogButtonBox.Cancel)
+        btn_cancel.setText(t("common.cancel"))
+        btn_cancel.setObjectName("secondary_btn")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         dlg_layout.addWidget(buttons)
@@ -438,7 +449,7 @@ class AddAccountDialog(QDialog):
         # 同步导入到上游 Key 池（立即写盘）
         try:
             from ...modules.proxy_server import ProxyDatabase
-            proxy_db = ProxyDatabase()
+            proxy_db = ProxyDatabase.get_instance()
             existing = {k.get("api_key", "") for k in proxy_db.get_upstream_keys()}
             if api_key not in existing:
                 import secrets as _sec
@@ -464,6 +475,73 @@ class AddAccountDialog(QDialog):
         self._status_label.setText(status)
         self._status_label.setStyleSheet("color: #38A169; font-size: 12px;")
 
+    def _import_card_keys(self):
+        """粘贴卡密批量导入，格式：昵称----apikey。"""
+        from PySide6.QtWidgets import QDialogButtonBox, QVBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("卡密导入")
+        dialog.setMinimumSize(520, 360)
+        dlg_layout = QVBoxLayout(dialog)
+
+        hint = QLabel("每行一个账号，格式：昵称----apikey")
+        hint.setStyleSheet("color: #9BA4B0; font-size: 12px;")
+        dlg_layout.addWidget(hint)
+
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("张三----ck_xxx\n李四----ck_xxx")
+        dlg_layout.addWidget(text_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.button(QDialogButtonBox.Ok).setText("导入")
+        buttons.button(QDialogButtonBox.Cancel).setText(t("common.cancel"))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        accounts = []
+        invalid = []
+        for line_no, raw_line in enumerate(text_edit.toPlainText().splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if "----" not in line:
+                invalid.append(str(line_no))
+                continue
+            nickname, api_key = [part.strip() for part in line.split("----", 1)]
+            if not nickname or not api_key:
+                invalid.append(str(line_no))
+                continue
+            accounts.append({
+                "uid": nickname,
+                "nickname": nickname,
+                "auth_token": api_key,
+                "api_key": api_key,
+                "ck": "",
+                "platform": Platform.CODEBUDDY,
+            })
+
+        if not accounts:
+            QMessageBox.warning(self, t("common.warning"), "没有可导入的卡密，请检查格式：昵称----apikey")
+            return
+
+        if invalid:
+            reply = QMessageBox.question(
+                self,
+                "格式提醒",
+                f"有 {len(invalid)} 行格式不正确，将跳过这些行并继续导入吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._on_batch_accounts_imported(accounts)
+        QMessageBox.information(self, "导入完成", f"已导入 {len(accounts)} 个账号")
+
     def _on_batch_accounts_imported(self, accounts: list):
         """批量导入回调：保存所有账号并通知刷新，同时自动导入到上游Key池"""
         if not accounts:
@@ -476,7 +554,7 @@ class AddAccountDialog(QDialog):
         # 1. 批量导入到上游Key池（一次写磁盘）
         try:
             from ...modules.proxy_server import ProxyDatabase
-            proxy_db = ProxyDatabase()
+            proxy_db = ProxyDatabase.get_instance()
             existing_keys = proxy_db.get_upstream_keys()
             existing_api_keys = {k.get("api_key", "") for k in existing_keys}
 
@@ -605,11 +683,16 @@ class AddAccountDialog(QDialog):
             QMessageBox.warning(self, t("common.warning"), "请先提取或登录账号")
             return
 
+        token = self._token_input.text()
+        # 如果 token 以 ck_ 开头，说明是 API Key，同时填到 api_key 字段
+        api_key = token if token.startswith("ck_") else ""
+
         account = Account(
             uid=self._uid_input.text() or f"user_{id(self)}",
             nickname=self._nickname_input.text(),
             platform=self._platform_combo.currentData(),
-            auth_token=self._token_input.text(),
+            auth_token=token,
+            api_key=api_key,
         )
         save_account(account)
         self.account_added.emit(account)
@@ -662,28 +745,28 @@ class CreditsDetailDialog(QDialog):
             type_text = type_map.get(pkg.package_type, pkg.package_type)
             self._pkg_table.setItem(row, 1, QTableWidgetItem(type_text))
 
-            # 剩余
-            remain_item = QTableWidgetItem(f"{pkg.capacity_remain:.1f}")
-            if pkg.capacity_remain <= 0:
+            # 剩余（用 cycle_remain 周期剩余，capacity_remain 对基础包不更新）
+            remain_item = QTableWidgetItem(f"{pkg.cycle_remain:.1f}")
+            if pkg.cycle_remain <= 0:
                 remain_item.setForeground(Qt.red)
             self._pkg_table.setItem(row, 2, remain_item)
 
             # 总量
-            self._pkg_table.setItem(row, 3, QTableWidgetItem(f"{pkg.capacity_size:.1f}"))
+            self._pkg_table.setItem(row, 3, QTableWidgetItem(f"{pkg.cycle_size:.1f}"))
 
             # 过期时间
             expire_text = self._format_expire(pkg.cycle_end)
             expire_item = QTableWidgetItem(expire_text)
             self._pkg_table.setItem(row, 4, expire_item)
 
-            # 统计
-            total_remain += pkg.capacity_remain
+            # 统计（用 cycle_remain 统计）
+            total_remain += pkg.cycle_remain
             if pkg.package_type in ("1", "4"):
-                base_remain += pkg.capacity_remain
+                base_remain += pkg.cycle_remain
             elif pkg.package_type == "2":
-                activity_remain += pkg.capacity_remain
+                activity_remain += pkg.cycle_remain
             else:
-                activity_remain += pkg.capacity_remain
+                activity_remain += pkg.cycle_remain
 
         # 如果没有积分包数据但有总量信息
         if not packages and (self._account.quota.credits_total > 0 or self._account.quota.credits_remaining > 0):
@@ -768,6 +851,8 @@ class AccountsPage(QWidget):
         self._accounts = []
         self._filtered_accounts = []
         self._current_page = 0
+        self._sort_column = None
+        self._sort_order = Qt.AscendingOrder
         self._setup_ui()
 
     def _setup_ui(self):
@@ -798,7 +883,7 @@ class AccountsPage(QWidget):
         for p in Platform:
             self._filter_combo.addItem(p.value, p)
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self._filter_combo)
+        self._filter_combo.setVisible(False)
 
         # 搜索框
         self._search_input = QLineEdit()
@@ -815,6 +900,13 @@ class AccountsPage(QWidget):
         self._btn_batch_del.clicked.connect(self._batch_delete)
         self._btn_batch_del.setVisible(False)
         toolbar.addWidget(self._btn_batch_del)
+
+        self._btn_batch_export = QPushButton("批量导出")
+        self._btn_batch_export.setObjectName("secondary_btn")
+        self._btn_batch_export.setCursor(Qt.PointingHandCursor)
+        self._btn_batch_export.clicked.connect(self._export_selected_accounts)
+        self._btn_batch_export.setVisible(False)
+        toolbar.addWidget(self._btn_batch_export)
 
         # 操作按钮
         btn_add = QPushButton(f"➕ {t('accounts.add_account')}")
@@ -833,9 +925,12 @@ class AccountsPage(QWidget):
         toolbar.addWidget(QLabel("并发数:"))
         self._concurrency_spin = QSpinBox()
         self._concurrency_spin.setRange(1, 50)
-        self._concurrency_spin.setValue(5)
-        self._concurrency_spin.setToolTip("同时查询的线程数，建议5-10")
-        self._concurrency_spin.setFixedWidth(60)
+        self._concurrency_spin.setValue(int(load_setting("account_concurrency", "5")))
+        self._concurrency_spin.setToolTip("同时请求线程数，范围 1-50")
+        self._concurrency_spin.valueChanged.connect(
+            lambda value: save_setting("account_concurrency", str(value))
+        )
+        self._concurrency_spin.setFixedWidth(80)
         toolbar.addWidget(self._concurrency_spin)
 
         self._btn_query_all = QPushButton("💎 查询全部积分")
@@ -844,12 +939,20 @@ class AccountsPage(QWidget):
         self._btn_query_all.clicked.connect(self._query_all_quotas)
         toolbar.addWidget(self._btn_query_all)
 
+        # 检查账号状态按钮
+        self._btn_check_status = QPushButton("🔍 检查账号状态")
+        self._btn_check_status.setObjectName("secondary_btn")
+        self._btn_check_status.setCursor(Qt.PointingHandCursor)
+        self._btn_check_status.setToolTip("批量检测所有账号的 API Key 是否被风控/失效，结果同步到上游 Key 池")
+        self._btn_check_status.clicked.connect(self._check_all_status)
+        toolbar.addWidget(self._btn_check_status)
+
         # 停止按钮
         self._btn_stop_query = QPushButton("⏹ 停止")
         self._btn_stop_query.setObjectName("secondary_btn")
         self._btn_stop_query.setStyleSheet(
-            "QPushButton { color: #E53E3E; border: 1px solid #E53E3E; }"
-            "QPushButton:hover { background-color: #FED7D7; }"
+            "QPushButton { color: #FC8181; border: 1px solid #FC8181; }"
+            "QPushButton:hover { background-color: rgba(229,62,62,0.1); }"
         )
         self._btn_stop_query.setCursor(Qt.PointingHandCursor)
         self._btn_stop_query.setVisible(False)
@@ -858,13 +961,17 @@ class AccountsPage(QWidget):
 
         content_layout.addLayout(toolbar)
 
-        # 表格 — 列：昵称、UID、积分、TK、CK、API状态
+        # 表格 – 列：昵称、UID、积分、TK、API状态
         self._table = QTableWidget()
-        self._table.setColumnCount(6)
+        self._table.setColumnCount(5)
         self._table.setHorizontalHeaderLabels([
-            "昵称", "UID", "积分", "TK", "CK", "API状态"
+            "昵称", "UID", "积分", "TK", "API状态"
         ])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_header_sort)
         self._table.setAlternatingRowColors(True)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -910,12 +1017,9 @@ class AccountsPage(QWidget):
 
         # 查询日志
         self._log_edit = QTextEdit()
+        self._log_edit.setObjectName("log_edit")
         self._log_edit.setReadOnly(True)
         self._log_edit.setMaximumHeight(120)
-        self._log_edit.setStyleSheet(
-            "QTextEdit { color: #9BA4B0; font-size: 12px; "
-            "background: #1A202C; border: 1px solid #2D3748; border-radius: 6px; padding: 8px; }"
-        )
         self._log_edit.setVisible(False)
         content_layout.addWidget(self._log_edit)
 
@@ -963,12 +1067,9 @@ class AccountsPage(QWidget):
         self._accounts = load_accounts()
 
     def _apply_filter(self):
-        platform = self._filter_combo.currentData()
         search = self._search_input.text().lower()
 
         filtered = self._accounts
-        if platform:
-            filtered = [a for a in filtered if a.platform == platform]
         if search:
             filtered = [a for a in filtered if
                        search in a.nickname.lower() or
@@ -978,6 +1079,44 @@ class AccountsPage(QWidget):
                        search in a.api_key.lower()]
 
         self._filtered_accounts = filtered
+        self._apply_sort()
+
+    def _account_sort_value(self, account: Account, column: int):
+        if column == 0:
+            return account.display_name.lower()
+        if column == 1:
+            return account.uid.lower()
+        if column == 2:
+            return account.quota.credits_remaining
+        if column == 3:
+            return account.auth_token.lower()
+        if column == 4:
+            return (
+                0 if account.status == AccountStatus.ACTIVE else 1,
+                0 if account.api_key else 1,
+                account.status.value,
+            )
+        return ""
+
+    def _apply_sort(self):
+        if self._sort_column is None:
+            return
+        reverse = self._sort_order == Qt.DescendingOrder
+        self._filtered_accounts.sort(
+            key=lambda account: self._account_sort_value(account, self._sort_column),
+            reverse=reverse,
+        )
+
+    def _on_header_sort(self, section: int):
+        if self._sort_column == section:
+            self._sort_order = Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+        else:
+            self._sort_column = section
+            self._sort_order = Qt.AscendingOrder
+        self._table.horizontalHeader().setSortIndicator(section, self._sort_order)
+        self._apply_sort()
+        self._current_page = 0
+        self._render_page()
 
     def _render_page(self):
         """只渲染当前页"""
@@ -1019,34 +1158,19 @@ class AccountsPage(QWidget):
                 tk_item.setForeground(Qt.gray)
             self._table.setItem(row, 3, tk_item)
 
-            # CK列 (ck 截断显示)
-            ck_text = account.ck
-            if ck_text:
-                ck_display = ck_text[:25] + "..." if len(ck_text) > 25 else ck_text
-            else:
-                ck_display = ""
-            ck_item = QTableWidgetItem(ck_display)
-            ck_item.setToolTip(ck_text if ck_text else "")  # 悬停显示完整值
-            if not ck_text:
-                ck_item.setForeground(Qt.gray)
-            self._table.setItem(row, 4, ck_item)
-
-            # API状态列 — 只显示有的凭证，空的就是空
-            status_parts = []
-            if account.api_key:
-                status_parts.append("✅ API")
-            if account.auth_token:
-                status_parts.append("✅ TK")
-            if account.ck:
-                status_parts.append("✅ CK")
-
-            api_status_text = "  ".join(status_parts) if status_parts else "—"
+            has_api = bool(account.api_key)
+            is_normal = account.status == AccountStatus.ACTIVE
+            api_status_text = ("有API" if has_api else "无API") + " · " + ("正常" if is_normal else "异常")
             api_status_item = QTableWidgetItem(api_status_text)
-            if status_parts:
+            if is_normal and has_api:
                 api_status_item.setForeground(Qt.darkGreen)
+            elif not is_normal:
+                api_status_item.setForeground(Qt.red)
             else:
                 api_status_item.setForeground(Qt.gray)
-            self._table.setItem(row, 5, api_status_item)
+            if account.status_reason:
+                api_status_item.setToolTip(account.status_reason)
+            self._table.setItem(row, 4, api_status_item)
 
         self._update_pager()
 
@@ -1088,6 +1212,9 @@ class AccountsPage(QWidget):
 
     def _on_selection_changed(self):
         selected = self._get_selected_accounts()
+        self._btn_batch_export.setVisible(bool(selected))
+        if selected:
+            self._btn_batch_export.setText(f"批量导出 ({len(selected)})")
         if len(selected) > 1:
             self._btn_batch_del.setVisible(True)
             self._btn_batch_del.setText(f"🗑️ 批量删除 ({len(selected)})")
@@ -1101,22 +1228,6 @@ class AccountsPage(QWidget):
             return
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: white;
-                border: 1px solid #E2E6EC;
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 8px 24px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #E8F4FD;
-                color: #2B6CB0;
-            }
-        """)
 
         if len(selected) == 1:
             account = selected[0]
@@ -1129,412 +1240,19 @@ class AccountsPage(QWidget):
             action_copy_api = menu.addAction("📋 复制 API Key")
             action_copy_api.triggered.connect(lambda: self._copy_field(account.api_key, "API Key"))
             menu.addSeparator()
-            action_login = menu.addAction("🌐 登录网页")
-            action_login.triggered.connect(lambda: self._login_webpage(account))
+            action_export = menu.addAction("批量导出")
+            action_export.triggered.connect(lambda: self._export_selected_accounts())
             menu.addSeparator()
             action_del = menu.addAction("🗑️ 删除账号")
             action_del.triggered.connect(lambda: self._delete_account(account))
         else:
+            action_export = menu.addAction(f"批量导出 ({len(selected)} 个账号)")
+            action_export.triggered.connect(lambda: self._export_selected_accounts())
+            menu.addSeparator()
             action_batch = menu.addAction(f"🗑️ 批量删除 ({len(selected)} 个账号)")
             action_batch.triggered.connect(lambda: self._batch_delete())
 
         menu.exec(QCursor.pos())
-
-    @staticmethod
-    def _get_browser_launch_args(headless=False):
-        """获取浏览器启动参数，优先使用系统 Edge/Chrome，避免下载 150MB 的 Chromium
-
-        Playwright 支持 channel 参数直接启动系统已安装的浏览器：
-        - channel="msedge" → Windows 自带的 Edge
-        - channel="chrome" → 用户安装的 Chrome
-        都不需要额外下载 Chromium。
-        """
-        import os, platform
-        args = {"headless": headless}
-        if platform.system() == "Windows":
-            # 优先用 Edge（Windows 系统自带，100% 有）
-            edge_paths = [
-                os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
-            ]
-            for p in edge_paths:
-                if os.path.exists(p):
-                    args["channel"] = "msedge"
-                    return args
-            # 其次用 Chrome
-            chrome_paths = [
-                os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-            ]
-            for p in chrome_paths:
-                if os.path.exists(p):
-                    args["channel"] = "chrome"
-                    return args
-        # 没找到系统浏览器 → 回退到默认（需要 Chromium）
-        return args
-
-    def _login_webpage(self, account: Account):
-        """右键登录网页 — 用 Playwright 打开系统浏览器登录 codebuddy.cn/profile/usage
-
-        使用系统自带的 Edge/Chrome，无需下载 Chromium。
-        登录优先级：1.本地Cookie → 2.服务器CK → 3.SMS验证码
-        """
-        import threading
-
-        uid = account.uid or ""
-        ck = account.ck or ""
-
-        # 从 ck 提取 sms_url（格式: phone----sms_url 或直接 sms_url）
-        sms_url = ""
-        phone = uid
-        if "----" in ck:
-            parts = ck.split("----", 1)
-            phone = parts[0].strip() or uid
-            sms_url = parts[1].strip()
-        elif ck.startswith("http"):
-            sms_url = ck
-
-        if not sms_url and not account.auth_token:
-            QMessageBox.warning(self, "无法登录", "此账号没有 CK（短信链接）也没有 TK（Token），无法登录。")
-            return
-
-        # 在后台线程中运行 Playwright（避免阻塞 UI）
-        def _run_login():
-            import asyncio
-            try:
-                asyncio.run(self._login_webpage_async(phone, sms_url, account))
-            except Exception as e:
-                from PySide6.QtCore import QMetaObject, Qt as _Qt
-                QMetaObject.invokeMethod(self, "_on_login_error", _Qt.QueuedConnection)
-
-        t = threading.Thread(target=_run_login, daemon=True)
-        t.start()
-
-    @staticmethod
-    def _clean_cookies(cookies_data):
-        """清理Cookie数据，确保Playwright能正确注入
-
-        参考 ck_login.py 的 _clean_cookies：
-        - 兼容字符串和 list 两种输入
-        - 修复 sameSite / expires 等字段
-        - 移除 url 字段（Playwright不需要）
-        """
-        if isinstance(cookies_data, str):
-            try:
-                cookies_data = json.loads(cookies_data)
-            except Exception:
-                return []
-        if not isinstance(cookies_data, list):
-            return []
-        cleaned = []
-        for c in cookies_data:
-            if not isinstance(c, dict):
-                continue
-            cookie = dict(c)
-            same_site = cookie.get("sameSite", "Lax")
-            if same_site not in ("Strict", "Lax", "None"):
-                cookie["sameSite"] = "Lax"
-            if "expires" in cookie and cookie["expires"] != -1:
-                try:
-                    cookie["expires"] = int(cookie["expires"])
-                except (ValueError, TypeError):
-                    cookie["expires"] = -1
-            cookie.pop("url", None)
-            if "name" not in cookie or "value" not in cookie:
-                continue
-            if "domain" not in cookie:
-                continue
-            cleaned.append(cookie)
-        return cleaned
-
-    @staticmethod
-    def _get_ck_from_server(phone: str, sms_url: str):
-        """从CK服务器获取Cookie数据
-
-        使用 phone + sms_url 双验证（与积分查询项目一致），
-        防止仅凭手机号获取他人Cookie。
-        """
-        try:
-            payload = json.dumps({
-                "api_key": CK_API_KEY,
-                "pairs": [{"phone": phone, "api_url": sms_url}]
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"{CK_SERVER_URL}/api/get_ck_by_phone",
-                data=payload,
-                headers={"Content-Type": "application/json", "X-API-Key": CK_API_KEY}
-            )
-            resp = urllib.request.urlopen(req, timeout=15)
-            result = json.loads(resp.read().decode("utf-8"))
-            if result.get("success"):
-                data = result.get("data", [])
-                if data:
-                    cookie_data = data[0].get("cookie_data", "")
-                    if cookie_data:
-                        if isinstance(cookie_data, str):
-                            return json.loads(cookie_data)
-                        return cookie_data
-        except Exception as e:
-            logger.debug(f"从CK服务器获取失败: {e}")
-        return None
-
-    async def _login_webpage_async(self, phone: str, sms_url: str, account: Account):
-        """异步登录网页（Playwright + 系统浏览器 Edge/Chrome）
-
-        登录优先级：
-        1. 本地 Cookie 文件（之前成功登录保存的 Keycloak 会话 Cookie）
-        2. 服务器 CK（从远程 CK 服务器获取最新 Cookie）
-        3. SMS 验证码（自动获取验证码并登录）
-
-        参考 ck_login.py 的 Cookie 注入方式：
-        先访问网站建立域上下文，再注入 Cookie，最后导航到目标页。
-        这是关键步骤 — 不先访问网站，Cookie 无法匹配域名。
-        """
-        import os, sys, json, asyncio, re, time
-        from pathlib import Path
-
-        USAGE_URL = "https://www.codebuddy.cn/profile/usage"
-        LOGIN_URL = (
-            "https://www.codebuddy.cn/login/?platform=usercenter&state=0"
-            "&redirect_uri=https%3A%2F%2Fwww.codebuddy.cn%2Fprofile%2Fusage"
-        )
-
-        # Cookie 存储路径 — 用 uid 作标识（比 phone 更稳定）
-        cookie_dir = Path(os.path.expanduser("~")) / ".antigravity-tools" / "cookies"
-        cookie_dir.mkdir(parents=True, exist_ok=True)
-        # 兼容：先按 uid 查找，再按 phone 查找
-        cookie_file_by_uid = cookie_dir / f"cookie_{account.uid}.json"
-        cookie_file_by_phone = cookie_dir / f"cookie_{phone}.json"
-        cookie_file = cookie_file_by_uid if cookie_file_by_uid.exists() else cookie_file_by_phone
-
-        # 修复 PyInstaller 打包后 Playwright 找不到浏览器的问题
-        if getattr(sys, 'frozen', False):
-            local_app = os.environ.get('LOCALAPPDATA', os.path.expanduser('~\\AppData\\Local'))
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(local_app, 'ms-playwright')
-
-            # 修复 Playwright driver 路径：打包后 driver 在 _internal/playwright/driver/
-            _base = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-            _driver_dir = os.path.join(_base, '_internal', 'playwright', 'driver')
-            if os.path.isdir(_driver_dir):
-                os.environ['PLAYWRIGHT_NODEJS_PATH'] = os.path.join(_driver_dir, 'node.exe')
-                try:
-                    import playwright._impl._driver as _pw_driver
-                    _cli_js = os.path.join(_driver_dir, 'package', 'cli.js')
-                    _pw_driver.compute_driver_executable = lambda: (
-                        os.environ.get('PLAYWRIGHT_NODEJS_PATH', os.path.join(_driver_dir, 'node.exe')),
-                        _cli_js,
-                    )
-                except Exception:
-                    pass
-
-        from playwright.async_api import async_playwright
-
-        pw = await async_playwright().start()
-        # 使用系统自带的 Edge/Chrome，无需下载 Chromium
-        browser = await pw.chromium.launch(**self._get_browser_launch_args(headless=False))
-        ctx = await browser.new_context(viewport={"width": 1280, "height": 900})
-        page = await ctx.new_page()
-
-        login_ok = False
-
-        # ── 1. 尝试本地 Cookie 文件登录 ──
-        # 参考 ck_login.py：先访问网站建立域上下文，再注入 Cookie
-        if cookie_file.exists():
-            try:
-                cookies_raw = json.loads(cookie_file.read_text(encoding="utf-8"))
-                cookies = self._clean_cookies(cookies_raw)
-                if cookies:
-                    # 关键：先访问网站建立域上下文，否则 Cookie 无法匹配域名
-                    await page.goto("https://www.codebuddy.cn", wait_until="domcontentloaded", timeout=30000)
-                    await ctx.add_cookies(cookies)
-                    # 再导航到目标页面
-                    await page.goto(USAGE_URL, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(5)
-                    if "login" not in page.url.lower():
-                        login_ok = True
-                        logger.info(f"本地 Cookie 登录成功: {phone}")
-                    else:
-                        # Cookie 过期，清除并删除文件
-                        await ctx.clear_cookies()
-                        cookie_file.unlink(missing_ok=True)
-                        logger.info(f"本地 Cookie 已过期，已删除: {cookie_file.name}")
-            except Exception as e:
-                logger.debug(f"本地 Cookie 登录异常: {e}")
-
-        # ── 2. 尝试从 CK 服务器获取最新 Cookie 登录 ──
-        if not login_ok and sms_url:
-            server_cookies = self._get_ck_from_server(phone, sms_url)
-            if server_cookies:
-                try:
-                    cookies = self._clean_cookies(server_cookies)
-                    if cookies:
-                        # 先访问网站建立域上下文
-                        if "codebuddy.cn" not in page.url:
-                            await page.goto("https://www.codebuddy.cn", wait_until="domcontentloaded", timeout=30000)
-                        await ctx.clear_cookies()
-                        await ctx.add_cookies(cookies)
-                        await page.goto(USAGE_URL, wait_until="domcontentloaded", timeout=30000)
-                        await asyncio.sleep(5)
-                        if "login" not in page.url.lower():
-                            login_ok = True
-                            # 保存服务器返回的 Cookie 到本地
-                            for cf in [cookie_file_by_uid, cookie_file_by_phone]:
-                                try:
-                                    cf.write_text(json.dumps(server_cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-                                except Exception:
-                                    pass
-                            logger.info(f"服务器 CK 登录成功: {phone}")
-                        else:
-                            await ctx.clear_cookies()
-                            logger.info(f"服务器 CK 也已过期: {phone}")
-                except Exception as e:
-                    logger.debug(f"服务器 CK 登录异常: {e}")
-
-        # ── 3. SMS 验证码登录 ──
-        if not login_ok and sms_url:
-            for retry in range(1, 4):
-                try:
-                    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(3)
-
-                    # 勾选协议
-                    try:
-                        cb = page.locator(".t-checkbox")
-                        if await cb.count() > 0:
-                            if not await cb.evaluate("el => el.classList.contains('t-is-checked')"):
-                                await cb.click(force=True)
-                                await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-
-                    await page.locator("text=手机号").click()
-                    await asyncio.sleep(3)
-
-                    # 再次勾选协议
-                    try:
-                        cb = page.locator(".t-checkbox")
-                        if await cb.count() > 0:
-                            if not await cb.evaluate("el => el.classList.contains('t-is-checked')"):
-                                await cb.click(force=True)
-                                await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-
-                    pf = page.frame(name="phone-iframe")
-                    if not pf:
-                        continue
-
-                    await pf.locator(".kc-country-selector").click()
-                    await asyncio.sleep(1)
-                    await pf.locator(".kc-country-option:has-text('中国香港')").click()
-                    await asyncio.sleep(1)
-
-                    await pf.locator("#phoneNumber").fill(phone)
-                    await pf.locator(".code-btn").click()
-
-                    # 等待验证码
-                    code = await asyncio.get_event_loop().run_in_executor(
-                        None, self._wait_for_sms_code, sms_url, 120, 5
-                    )
-                    if not code:
-                        continue
-
-                    await pf.locator("#code").fill(code)
-
-                    # 勾选协议
-                    try:
-                        cb = page.locator(".t-checkbox")
-                        if await cb.count() > 0:
-                            if not await cb.evaluate("el => el.classList.contains('t-is-checked')"):
-                                await cb.click(force=True)
-                                await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-
-                    await pf.locator("#kc-login").click()
-
-                    for _ in range(25):
-                        await asyncio.sleep(1)
-                        if "login" not in page.url.lower():
-                            break
-
-                    await asyncio.sleep(3)
-                    if "login" not in page.url.lower():
-                        login_ok = True
-                        break
-                except Exception:
-                    if retry >= 3:
-                        break
-
-        # ── 登录成功处理 ──
-        if login_ok:
-            # 保存 Cookie 到本地（覆盖或新建）
-            try:
-                cookies = await ctx.cookies()
-                # 同时保存到 uid 和 phone 命名的 Cookie 文件，下次登录都能找到
-                for cf in [cookie_file_by_uid, cookie_file_by_phone]:
-                    try:
-                        cf.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # 总是更新账号的 CK 字段（确保 SMS URL 是最新的）
-            try:
-                new_ck = f"{phone}----{sms_url}" if sms_url else phone
-                if account.ck != new_ck:
-                    account.ck = new_ck
-                    from ...utils.store import save_account as _save
-                    _save(account)
-                    # 通知 UI 刷新表格
-                    from PySide6.QtCore import QMetaObject, Qt as _Qt
-                    QMetaObject.invokeMethod(self, "_refresh_table", _Qt.QueuedConnection)
-            except Exception:
-                pass
-
-            # 跳转到用量管理页
-            if "usage" not in page.url.lower():
-                await page.goto(USAGE_URL, wait_until="domcontentloaded", timeout=30000)
-
-            # 浏览器保持打开，不关闭
-            # 不调用 browser.close()，让用户手动关闭
-            # 注意：pw（Playwright 实例）也不关闭，否则浏览器进程会被终止
-        else:
-            # 登录失败才关闭浏览器
-            await browser.close()
-            await pw.stop()
-
-    @staticmethod
-    def _wait_for_sms_code(sms_url: str, max_wait: int = 120, interval: int = 5) -> str:
-        """阻塞等待短信验证码（在子线程中调用）"""
-        import re, urllib.request, time
-
-        elapsed = 0
-        while elapsed < max_wait:
-            try:
-                req = urllib.request.Request(sms_url)
-                req.add_header("User-Agent", "Mozilla/5.0")
-                resp = urllib.request.urlopen(req, timeout=10)
-                body = resp.read().decode("utf-8").strip()
-                if body and body != "0|0":
-                    parts = body.split("|")
-                    if parts[0] != "0":
-                        code = parts[0].strip()
-                        digits = re.findall(r'\d{4,6}', code)
-                        return digits[0] if digits else code
-            except Exception:
-                pass
-            time.sleep(interval)
-            elapsed += interval
-        return ""
-
-    @Slot()
-    def _on_login_error(self):
-        """登录异常提示"""
-        QMessageBox.warning(self, "登录失败", "登录过程中出现异常，请重试。")
 
     def _show_credits_detail(self, account: Account):
         """显示积分明细弹窗"""
@@ -1585,7 +1303,7 @@ class AccountsPage(QWidget):
             # 联动更新上游 Key 池
             try:
                 from ...modules.proxy_server import ProxyDatabase
-                db = ProxyDatabase()
+                db = ProxyDatabase.get_instance()
                 db.sync_quota_to_key(
                     api_key_or_token=getattr(account, "api_key", None) or account.auth_token,
                     remaining_credits=remaining,
@@ -1646,7 +1364,7 @@ class AccountsPage(QWidget):
                     # 联动更新上游 Key 池
                     try:
                         from ...modules.proxy_server import ProxyDatabase
-                        db = ProxyDatabase()
+                        db = ProxyDatabase.get_instance()
                         db.sync_quota_to_key(
                             api_key_or_token=getattr(acc, "api_key", None) or acc.auth_token,
                             remaining_credits=remaining,
@@ -1733,7 +1451,7 @@ class AccountsPage(QWidget):
                                         # 联动更新上游 Key 池
                                         try:
                                             from ...modules.proxy_server import ProxyDatabase
-                                            db = ProxyDatabase()
+                                            db = ProxyDatabase.get_instance()
                                             db.sync_quota_to_key(
                                                 api_key_or_token=getattr(acc, "api_key", None) or acc.auth_token,
                                                 remaining_credits=remaining,
@@ -1753,10 +1471,13 @@ class AccountsPage(QWidget):
         self._batch_worker.start()
 
     def _stop_query(self):
-        """停止查询"""
+        """停止查询/检测"""
         if hasattr(self, '_batch_worker') and self._batch_worker:
             self._batch_worker.stop()
             self._append_log("⏹ 正在停止查询...")
+        if hasattr(self, '_status_check_worker') and self._status_check_worker:
+            self._status_check_worker.stop()
+            self._append_log("⏹ 正在停止检测...")
         self._btn_stop_query.setEnabled(False)
 
     def _append_log(self, text: str):
@@ -1783,6 +1504,142 @@ class AccountsPage(QWidget):
         self._render_page()
         self.quota_updated.emit()  # 通知其他页面刷新
 
+    def _check_all_status(self):
+        """检查所有账号的 API Key 状态（风控/失效），同步到上游 Key 池"""
+        from PySide6.QtCore import QThread, Signal as QSignal
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        self._load_accounts()
+        accounts_with_key = [a for a in self._accounts if a.api_key]
+        if not accounts_with_key:
+            QMessageBox.information(self, "提示", "没有配置 API Key 的账号，无需检测")
+            return
+
+        max_workers = self._concurrency_spin.value()
+        self._btn_check_status.setEnabled(False)
+        self._btn_query_all.setEnabled(False)
+        self._btn_stop_query.setVisible(True)
+        self._btn_stop_query.setEnabled(True)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, len(accounts_with_key))
+        self._progress_bar.setValue(0)
+        self._log_edit.clear()
+        self._log_edit.setVisible(True)
+        self._append_log(f"🔍 开始检测 {len(accounts_with_key)} 个账号状态，并发数: {max_workers}")
+
+        class StatusCheckWorker(QThread):
+            """后台并发检测 API Key 风控状态线程"""
+            progress = QSignal(str, bool, str)  # nickname, success, status_text
+            done = QSignal(int, int, int, list, list)  # (正常, 异常, 失败, 异常key列表, 限流key列表)
+
+            def __init__(self, accounts, max_workers=5):
+                super().__init__()
+                self._accounts = accounts
+                self.max_workers = max_workers
+                self._stop_flag = False
+
+            def stop(self):
+                self._stop_flag = True
+
+            def _check_one(self, acc):
+                api_key = acc.api_key
+                nickname = acc.nickname or acc.uid
+                try:
+                    result = check_api_key_chat_status(api_key, attempts=3)
+                    return (
+                        nickname,
+                        result.get("success", False),
+                        result.get("status_text", "check_failed"),
+                        api_key,
+                        result.get("flag"),
+                    )
+                except Exception as e:
+                    return (nickname, False, f"异常: {e}", api_key, None)
+
+            def run(self):
+                normal = 0
+                abnormal = 0
+                failed = 0
+                abnormal_keys = []
+                rate_limited_keys = []
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {executor.submit(self._check_one, acc): acc
+                               for acc in self._accounts}
+                    for future in as_completed(futures):
+                        if self._stop_flag:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        try:
+                            nickname, success, status_text, api_key, flag = future.result()
+                            self.progress.emit(nickname, success, status_text)
+                            if flag == "abnormal":
+                                abnormal += 1
+                                abnormal_keys.append(api_key)
+                            elif flag == "rate_limited":
+                                abnormal += 1
+                                rate_limited_keys.append(api_key)
+                            elif success:
+                                normal += 1
+                            else:
+                                failed += 1
+                        except Exception:
+                            failed += 1
+                self.done.emit(normal, abnormal, failed, abnormal_keys, rate_limited_keys)
+
+        worker = StatusCheckWorker(accounts_with_key, max_workers=max_workers)
+
+        def _on_progress(nickname, success, status_text):
+            current = self._progress_bar.value() + 1
+            self._progress_bar.setValue(current)
+            icon = "✅" if success else ("⚠️" if status_text in ("风控异常", "限流(401)") else "❌")
+            self._append_log(f"{icon} {nickname} → {status_text}")
+
+        def _on_done(normal, abnormal, failed, abnormal_keys, rate_limited_keys):
+            self._btn_check_status.setEnabled(True)
+            self._btn_query_all.setEnabled(True)
+            self._btn_stop_query.setVisible(False)
+            self._btn_stop_query.setEnabled(True)
+            self._progress_bar.setVisible(False)
+
+            # 同步到上游 Key 池
+            try:
+                from ...modules.proxy_server import ProxyDatabase
+                proxy_db = ProxyDatabase.get_instance()
+                all_keys = proxy_db.get_upstream_keys()
+                for k in all_keys:
+                    k_api = k.get("api_key", "")
+                    k_id = k.get("key_id", "")
+                    if k_api in abnormal_keys and k.get("status") != "abnormal":
+                        proxy_db.update_upstream_key(k_id, {"status": "abnormal"})
+                    elif k_api in rate_limited_keys and k.get("status") != "rate_limited":
+                        proxy_db.update_upstream_key(k_id, {"status": "rate_limited"})
+                    elif (k_api not in abnormal_keys
+                          and k_api not in rate_limited_keys
+                          and k.get("status") in ("abnormal", "rate_limited")):
+                        # 之前异常/限流，本次检测通过 → 恢复 active
+                        proxy_db.update_upstream_key(k_id, {"status": "active"})
+                proxy_db._dirty = True
+                proxy_db._flush_to_disk()
+                self._append_log("✅ 上游 Key 池已同步")
+            except Exception as e:
+                self._append_log(f"⚠️ 同步上游池失败: {e}")
+
+            rate_limited_count = len(rate_limited_keys)
+            msg = f"检测完成：✅ 正常 {normal} 个"
+            if abnormal > 0:
+                msg += f"，⚠️ 异常 {abnormal} 个（已标记到上游池）"
+            if rate_limited_count > 0:
+                msg += f"，⚠️ 限流 {rate_limited_count} 个（已标记限流）"
+            if failed > 0:
+                msg += f"，❓ 失败 {failed} 个"
+            self._append_log(msg)
+            QMessageBox.information(self, "检测完成", msg)
+
+        worker.progress.connect(_on_progress)
+        worker.done.connect(_on_done)
+        self._status_check_worker = worker
+        worker.start()
+
     def _copy_field(self, value: str, label: str):
         """复制指定字段到剪贴板"""
         if not value:
@@ -1790,11 +1647,40 @@ class AccountsPage(QWidget):
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(value)
 
+    def _export_selected_accounts(self):
+        selected = self._get_selected_accounts()
+        rows = [
+            f"{account.display_name}----{account.api_key}"
+            for account in selected
+            if account.api_key
+        ]
+        if not selected:
+            return
+        if not rows:
+            QMessageBox.warning(self, t("common.warning"), "选中的账号没有可导出的 API Key")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出账号 API Key",
+            "accounts_api_keys.txt",
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(rows))
+            QMessageBox.information(self, "导出完成", f"已导出 {len(rows)} 个 API Key")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件：{e}")
+
     def _sync_delete_key_pool(self, account: Account):
         """删除账号时同步删除 Key 池中对应的 Key"""
         try:
             from ...modules.proxy_server import ProxyDatabase
-            proxy_db = ProxyDatabase()
+            proxy_db = ProxyDatabase.get_instance()
             keys = proxy_db.get_upstream_keys()
             # 用 api_key 或 auth_token 匹配
             tokens_to_remove = set()
@@ -1926,7 +1812,7 @@ class AccountsPage(QWidget):
                         if api_key:
                             try:
                                 from ...modules.proxy_server import ProxyDatabase
-                                proxy_db = ProxyDatabase()
+                                proxy_db = ProxyDatabase.get_instance()
                                 existing_keys = {k.get("api_key", "") for k in proxy_db.get_upstream_keys()}
                                 if api_key not in existing_keys:
                                     import secrets as _sec
@@ -1963,12 +1849,21 @@ class AccountsPage(QWidget):
         except (json.JSONDecodeError, TypeError):
             pass  # 不是JSON，尝试文本格式
 
-        # 文本格式：每行一个 Token 或 API Key
+        # 文本格式：每行一个 Token 或 API Key，支持 "手机号----apikey" 格式
         tokens = []
         for line in content.strip().splitlines():
             line = line.strip()
             if not line:
                 continue
+            if "----" in line:
+                # 格式：手机号----apikey
+                parts = line.split("----")
+                if len(parts) >= 2:
+                    phone = parts[0].strip().strip('"').strip("'")
+                    api_key = parts[1].strip().strip('"').strip("'")
+                    if phone and api_key:
+                        tokens.append({"phone": phone, "api_key": api_key})
+                        continue
             if "," in line:
                 for part in line.split(","):
                     part = part.strip().strip('"').strip("'")
@@ -1985,6 +1880,44 @@ class AccountsPage(QWidget):
 
         for token in tokens:
             try:
+                # 支持 "手机号----apikey" 格式（dict）
+                if isinstance(token, dict):
+                    phone = token["phone"]
+                    api_key = token["api_key"]
+                    uid = phone
+                    nickname = phone
+                    account = Account(
+                        uid=uid,
+                        nickname=nickname,
+                        platform=Platform.CODEBUDDY,
+                        auth_token=api_key,
+                        api_key=api_key,
+                    )
+                    save_account(account)
+                    # 导入上游池
+                    try:
+                        from ...modules.proxy_server import ProxyDatabase
+                        proxy_db = ProxyDatabase.get_instance()
+                        existing_keys = {k.get("api_key", "") for k in proxy_db.get_upstream_keys()}
+                        if api_key not in existing_keys:
+                            import secrets as _sec
+                            proxy_db.add_upstream_key({
+                                "key_id": f"ck_{_sec.token_hex(4)}",
+                                "api_key": api_key,
+                                "label": phone,
+                                "status": "active",
+                                "points": "",
+                                "points_updated_at": "",
+                                "packages": [],
+                                "created_at": "",
+                            })
+                            proxy_db._dirty = True
+                            proxy_db._flush_to_disk()
+                    except Exception:
+                        pass
+                    added += 1
+                    continue
+
                 # ck_ 开头按 API Key 处理
                 if token.startswith("ck_"):
                     uid = f"api_{token[3:11]}"
@@ -2000,7 +1933,7 @@ class AccountsPage(QWidget):
                     # 导入上游池
                     try:
                         from ...modules.proxy_server import ProxyDatabase
-                        proxy_db = ProxyDatabase()
+                        proxy_db = ProxyDatabase.get_instance()
                         existing_keys = {k.get("api_key", "") for k in proxy_db.get_upstream_keys()}
                         if token not in existing_keys:
                             import secrets as _sec
@@ -2082,7 +2015,7 @@ class ServerFetchDialog(QDialog):
             "• 手机号----登录URL\n"
             "• 子API Key (sk_xxx)"
         )
-        hint.setStyleSheet("color: #718096; font-size: 12px; padding: 4px 8px; background: #F7FAFC; border-radius: 6px;")
+        hint.setObjectName("inline_hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -2159,6 +2092,7 @@ class ServerFetchDialog(QDialog):
 
         btn_row.addStretch()
         close_btn = QPushButton("关闭")
+        close_btn.setObjectName("secondary_btn")
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(close_btn)
 

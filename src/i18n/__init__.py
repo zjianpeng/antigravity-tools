@@ -16,9 +16,7 @@ _zh_cn = {
     "nav.accounts": "账号管理",
     "nav.checkin": "每日签到",
     "nav.quota": "配额监控",
-    "nav.fingerprints": "设备指纹",
     "nav.api_proxy": "API 代理",
-    "nav.instances": "多实例",
     "nav.settings": "设置",
 
     # 平台名
@@ -104,22 +102,6 @@ _zh_cn = {
     "api_proxy.generate_key": "生成 Key",
     "api_proxy.rotate_key": "轮换 Key",
 
-    # 设备指纹
-    "fingerprints.title": "设备指纹",
-    "fingerprints.device_id": "设备 ID",
-    "fingerprints.machine_id": "机器 ID",
-    "fingerprints.generate": "生成指纹",
-    "fingerprints.apply": "应用指纹",
-    "fingerprints.notes": "备注",
-
-    # 多实例
-    "instances.title": "多实例管理",
-    "instances.create": "创建实例",
-    "instances.start": "启动",
-    "instances.stop": "停止",
-    "instances.parallel_run": "并行运行",
-    "instances.user_data_dir": "用户数据目录",
-
     # 设置
     "settings.title": "设置",
     "settings.general": "通用",
@@ -149,9 +131,7 @@ _en = {
     "nav.accounts": "Accounts",
     "nav.checkin": "Check In",
     "nav.quota": "Quota",
-    "nav.fingerprints": "Fingerprints",
     "nav.api_proxy": "API Proxy",
-    "nav.instances": "Instances",
     "nav.settings": "Settings",
     "common.add": "Add",
     "common.edit": "Edit",
@@ -170,8 +150,6 @@ _en = {
     "checkin.title": "Daily Check In",
     "quota.title": "Quota Monitor",
     "api_proxy.title": "API Proxy Service",
-    "fingerprints.title": "Device Fingerprints",
-    "instances.title": "Multi-Instance",
     "settings.title": "Settings",
     "settings.theme": "Theme",
     "settings.theme_light": "Light",

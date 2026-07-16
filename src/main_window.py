@@ -6,7 +6,8 @@ import subprocess
 import sys
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QStackedWidget, QSystemTrayIcon,
-    QMenu, QMessageBox, QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton
+    QMenu, QMessageBox, QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton,
+    QApplication,
 )
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import Qt, QSize, Slot
@@ -72,28 +73,6 @@ class MainWindow(QMainWindow):
     def _on_update_available(self, version: str, changelog: str, download_url: str, sha256: str):
         """发现新版本 — 弹窗提示"""
         current = get_current_version()
-
-        if getattr(sys, 'frozen', False):
-            # 打包模式：提示去下载，不支持自动覆盖更新
-            msg = QMessageBox(self)
-            msg.setWindowTitle("发现新版本")
-            msg.setIcon(QMessageBox.Icon.Information)
-            msg.setText(f"发现新版本 v{version}！（当前 v{current}）")
-            dl_text = ""
-            if download_url:
-                dl_text = f"\n\n📥 下载地址：{download_url}"
-            msg.setInformativeText(
-                f"更新内容：\n{changelog}"
-                f"{dl_text}"
-            )
-            # 添加"打开下载页"按钮
-            open_btn = msg.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
-            msg.addButton(QMessageBox.StandardButton.Close)
-            result = msg.exec()
-            if msg.clickedButton() == open_btn and download_url:
-                import webbrowser
-                webbrowser.open(download_url)
-            return
 
         msg = QMessageBox(self)
         msg.setWindowTitle("发现新版本")
@@ -170,19 +149,32 @@ class MainWindow(QMainWindow):
             self._update_dialog = None
 
         if success:
-            # 更新成功 — 提示重启
-            msg = QMessageBox(self)
-            msg.setWindowTitle("更新成功")
-            msg.setIcon(QMessageBox.Icon.Information)
-            msg.setText("✅ 更新已下载并安装完成！")
-            msg.setInformativeText("需要重启应用才能生效，是否立即重启？")
-            msg.setStandardButtons(
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            if message == "UPDATE_NEED_RESTART":
+                # 打包模式：批处理已启动，直接退出让批处理接管
+                msg = QMessageBox(self)
+                msg.setWindowTitle("更新就绪")
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.setText("✅ 更新已下载完成！")
+                msg.setInformativeText("点击「确定」后将自动关闭并完成更新，请稍候片刻自动重启。")
+                msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+                msg.exec()
+                # 批处理已经在等待进程退出，直接退出即可
+                QApplication.quit()
+                os._exit(0)
+            else:
+                # 源码模式：更新成功 — 提示重启
+                msg = QMessageBox(self)
+                msg.setWindowTitle("更新成功")
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.setText("✅ 更新已下载并安装完成！")
+                msg.setInformativeText("需要重启应用才能生效，是否立即重启？")
+                msg.setStandardButtons(
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                msg.setDefaultButton(QMessageBox.StandardButton.Yes)
 
-            if msg.exec() == QMessageBox.StandardButton.Yes:
-                self._restart_app()
+                if msg.exec() == QMessageBox.StandardButton.Yes:
+                    self._restart_app()
         else:
             QMessageBox.warning(self, "更新失败", f"❌ {message}")
 
@@ -366,7 +358,17 @@ class MainWindow(QMainWindow):
         """应用主题"""
         self._current_theme = theme
         stylesheet = get_stylesheet(theme)
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(stylesheet)
         self.setStyleSheet(stylesheet)
+        # 通知各页面刷新动态颜色（硬编码样式的控件需要手动更新）
+        for page in self._pages.values():
+            if hasattr(page, "apply_theme"):
+                try:
+                    page.apply_theme()
+                except Exception:
+                    pass
 
     def _show_window(self):
         """显示窗口"""
@@ -390,14 +392,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # 2. 关闭 Playwright 启动的浏览器残留进程
-        self._kill_playwright_browsers()
-
-        # 3. 注意：不关闭 WorkBuddy 进程！
+        # 2. 注意：不关闭 WorkBuddy 进程！
         #    WorkBuddy 是独立应用，只有用户在登录流程中主动确认时才会关闭（oauth.py）
         #    关闭本软件不应影响用户正在使用的 WorkBuddy
 
-        # 4. 关闭所有 QThread（签到、查询等后台任务）
+        # 3. 关闭所有 QThread（签到、查询等后台任务）
         for page in self._pages.values():
             try:
                 if hasattr(page, '_worker') and page._worker:
@@ -438,43 +437,6 @@ class MainWindow(QMainWindow):
         if still_alive:
             logger.warning(f"还有 {len(still_alive)} 个线程未退出，强制终止进程")
             os._exit(0)
-
-    def _kill_playwright_browsers(self):
-        """关闭 Playwright 启动的浏览器残留进程
-        
-        Playwright 通过 launch() 启动的 Edge/Chrome 浏览器，
-        如果用户手动关了窗口但进程仍在后台（或根本没关），
-        主进程退出后这些浏览器进程不会自动关闭。
-        
-        识别方法：Playwright 启动的浏览器命令行包含 --remote-debugging-pipe
-        """
-        import subprocess
-        try:
-            # 用 wmic 查找带 --remote-debugging-pipe 的 msedge/chrome 进程
-            # 这是 Playwright launch() 启动浏览器的标志性参数
-            result = subprocess.run(
-                ["wmic", "process", "where",
-                 "commandline like '%%--remote-debugging-pipe%%' and (name='msedge.exe' or name='chrome.exe')",
-                 "get", "processid"],
-                capture_output=True, text=True, timeout=5,
-            )
-            pids = []
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line.isdigit():
-                    pids.append(line)
-
-            if pids:
-                logger.info(f"发现 {len(pids)} 个 Playwright 浏览器残留进程，正在关闭...")
-                for pid in pids:
-                    try:
-                        subprocess.run(["taskkill", "/PID", pid, "/F"],
-                                       capture_output=True, timeout=3)
-                        logger.debug(f"已关闭残留浏览器进程 PID={pid}")
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.debug(f"检查 Playwright 浏览器残留进程时出错: {e}")
 
     def _kill_workbuddy_process(self):
         """已弃用 — 不再在软件关闭时杀 WorkBuddy
