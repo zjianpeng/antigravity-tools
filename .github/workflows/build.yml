@@ -75,10 +75,10 @@ jobs:
         run: |
           file "dist/Antigravity Tools.app/Contents/MacOS/"*
 
-      - name: Package as zip
+      - name: Package with ditto
         run: |
           cd dist
-          zip -r "Antigravity-Tools-macOS-Intel.zip" "Antigravity Tools.app"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "Antigravity Tools.app" "Antigravity-Tools-macOS-Intel.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -105,10 +105,10 @@ jobs:
         run: |
           python -m PyInstaller antigravity-mac.spec --noconfirm
 
-      - name: Package as zip
+      - name: Package with ditto
         run: |
           cd dist
-          zip -r "Antigravity-Tools-macOS-ARM.zip" "Antigravity Tools.app"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "Antigravity Tools.app" "Antigravity-Tools-macOS-ARM.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
