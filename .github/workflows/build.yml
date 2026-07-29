@@ -143,6 +143,28 @@ jobs:
       - name: Display structure
         run: find artifacts -type f
 
+      - name: Extract changelog for this version
+        id: changelog
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PYEOF'
+          import ast, os
+          src = open('src/ui/pages/changelog.py', encoding='utf-8').read()
+          data = []
+          for node in ast.parse(src).body:
+              if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', '') == 'CHANGELOG':
+                  data = ast.literal_eval(node.value)
+                  break
+          version = os.environ['BUILD_VERSION']
+          entry = next((e for e in data if e['version'] == version), None)
+          notes = '\n'.join(f"- {i}" for i in entry['items']) if entry else '见提交记录'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('notes<<CHGEOF\n')
+              f.write(notes + '\n')
+              f.write('CHGEOF\n')
+          PYEOF
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -150,6 +172,10 @@ jobs:
           name: Antigravity Tools v${{ steps.version.outputs.version }}
           body: |
             ## Antigravity Tools v${{ steps.version.outputs.version }}
+
+            ### 更新内容
+
+            ${{ steps.changelog.outputs.notes }}
 
             ### 下载
 
