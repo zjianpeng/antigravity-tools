@@ -95,6 +95,20 @@ if os.path.isdir(translations_dir):
 
 # ─── 隐式导入 ───
 hiddenimports = [
+    # 标准库（src 以 datas 源码形式打包，import 图分析不到，必须显式列出）
+    'sqlite3',
+    'http.server',
+    'socketserver',
+    'plistlib',
+    'webbrowser',
+    'secrets',
+    'select',
+    'atexit',
+    'ssl',
+    'hashlib',
+    'concurrent.futures',
+    'urllib.parse',
+    'logging.handlers',
     'PySide6.QtWidgets',
     'PySide6.QtCore',
     'PySide6.QtGui',
@@ -217,8 +231,8 @@ app = BUNDLE(
         'CFBundleName': 'Antigravity Tools',
         'CFBundleDisplayName': 'Antigravity Tools',
         'CFBundleIdentifier': 'com.antigravity.tools',
-        'CFBundleVersion': '1.0.0',
-        'CFBundleShortVersionString': '1.0.0',
+        'CFBundleVersion': '2.0.0',
+        'CFBundleShortVersionString': '2.0.0',
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '10.15',
         'NSRequiresAquaSystemAppearance': False,

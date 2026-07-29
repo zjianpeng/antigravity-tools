@@ -1,14 +1,20 @@
 {
     "version": "1.8.0",
-    "changelog": "v1.5.3 更新内容：\n\n修复上游 Key 被误禁用的问题（查分返回空数据时不再禁用）\n专一模式改为真正粘住一个 Key，用到不可用才切换\n新增轮询模式，每次请求轮换 Key，均匀分散压力\n修复高并发下选 Key 异常导致\"无可用上游\"的问题\n自动查分间隔改为 5 分钟\n更新提示同一版本不重复弹窗\n\n下载地址 https://wwbvx.lanzouw.com/b0fqdlz3e\n密码: 0000",
-    "release_date": "2026-06-18",
-    "download_url": "https://wwbvx.lanzouw.com/b0fqdlz3e",
+    "changelog": "1.增加导出功能\n2.新增卡密导入功能\n3.增加排序\n4.账号管理增加检测账号（支持高并发）\n5.修复账号管理删除账号后上游池不同步删除问题\n6.其他已知bug\n7.更新失败请至qq群下载1025605799",
+    "release_date": "2026-07-16",
+    "download_url": "https://github.com/qinchangxv/antigravity-tools/releases/tag/v1.8.0",
     "sha256": "",
     "platforms": {
         "windows": {
             "version": "1.8.0",
-            "changelog": "v1.5.3 更新内容：\n\n修复上游 Key 被误禁用的问题（查分返回空数据时不再禁用）\n专一模式改为真正粘住一个 Key，用到不可用才切换\n新增轮询模式，每次请求轮换 Key，均匀分散压力\n修复高并发下选 Key 异常导致\"无可用上游\"的问题\n自动查分间隔改为 5 分钟\n更新提示同一版本不重复弹窗\n\n下载地址 https://wwbvx.lanzouw.com/b0fqdlz3e\n密码: 0000",
-            "download_url": "https://wwbvx.lanzouw.com/b0fqdlz3e",
+            "changelog": "1.增加导出功能\n2.新增卡密导入功能\n3.增加排序\n4.账号管理增加检测账号（支持高并发）\n5.修复账号管理删除账号后上游池不同步删除问题\n6.其他已知bug\n7.更新失败请至qq群下载1025605799",
+            "download_url": "https://github.com/qinchangxv/antigravity-tools/releases/download/v1.8.0/Antigravity-Tools-Windows-x64.zip",
+            "sha256": ""
+        },
+        "mac": {
+            "version": "1.8.0",
+            "changelog": "1.增加导出功能\n2.新增卡密导入功能\n3.增加排序\n4.账号管理增加检测账号（支持高并发）\n5.修复账号管理删除账号后上游池不同步删除问题\n6.其他已知bug\n7.更新失败请至qq群下载1025605799",
+            "download_url": "https://github.com/qinchangxv/antigravity-tools/releases/tag/v1.8.0",
             "sha256": ""
         }
     }

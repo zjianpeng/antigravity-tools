@@ -18,7 +18,7 @@ def _get_version() -> str:
                 return f"v{f.read().strip()}"
         except Exception:
             pass
-    return "v1.8.0"
+    return "v2.0.0"
 
 
 # 导航项定义： (id, 图标emoji, 标签)
@@ -27,6 +27,7 @@ NAV_ITEMS = [
     ("accounts", "👥", "nav.accounts"),
     ("checkin", "✅", "nav.checkin"),
     ("api_proxy", "🔗", "nav.api_proxy"),
+    ("changelog", "📋", "nav.changelog"),
     ("settings", "⚙️", "nav.settings"),
 ]
 
@@ -53,13 +54,10 @@ class Sidebar(QWidget):
         logo_label.setObjectName("sidebar_logo")
         layout.addWidget(logo_label)
 
-        # 版本 + QQ群
-        version_qq_label = QLabel(f"{_get_version()}  💬QQ群:1025605799")
-        version_qq_label.setObjectName("sidebar_version")
-        version_qq_label.setCursor(Qt.PointingHandCursor)
-        version_qq_label.setToolTip("点击复制QQ群号")
-        version_qq_label.mousePressEvent = lambda e: self._copy_qq_group()
-        layout.addWidget(version_qq_label)
+        # 版本号
+        version_label = QLabel(_get_version())
+        version_label.setObjectName("sidebar_version")
+        layout.addWidget(version_label)
 
         # 分隔线
         sep = QFrame()
@@ -95,11 +93,6 @@ class Sidebar(QWidget):
 
         # 默认选中 dashboard
         self._buttons["dashboard"].setChecked(True)
-
-    def _copy_qq_group(self):
-        """复制QQ群号到剪贴板"""
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText("1025605799")
 
     def _on_nav_clicked(self, page_id: str):
         """导航按钮点击"""

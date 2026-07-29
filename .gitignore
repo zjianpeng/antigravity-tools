@@ -57,3 +57,7 @@ tmp/
 temp/
 nul
 新建文件夹/
+
+# 工具生成/本地数据（非源码）
+.workbuddy/
+graphify-out/

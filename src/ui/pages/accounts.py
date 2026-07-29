@@ -876,6 +876,8 @@ class AccountsPage(QWidget):
         content_layout.setSpacing(16)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.setContentsMargins(0, 0, 0, 0)
 
         # 平台筛选
         self._filter_combo = QComboBox()
@@ -884,6 +886,19 @@ class AccountsPage(QWidget):
             self._filter_combo.addItem(p.value, p)
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         self._filter_combo.setVisible(False)
+
+        # 按状态一键全选
+        self._select_status_combo = QComboBox()
+        self._select_status_combo.addItem("按状态全选")
+        self._select_status_combo.addItem("· 正常")
+        self._select_status_combo.addItem("· 异常")
+        self._select_status_combo.addItem("· 有API")
+        self._select_status_combo.addItem("· 无API")
+        self._select_status_combo.addItem("取消选择")
+        self._select_status_combo.setFixedWidth(130)
+        self._select_status_combo.setToolTip("按 API 状态一键选中对应账号")
+        self._select_status_combo.currentIndexChanged.connect(self._on_select_by_status)
+        toolbar.addWidget(self._select_status_combo)
 
         # 搜索框
         self._search_input = QLineEdit()
@@ -894,14 +909,14 @@ class AccountsPage(QWidget):
         toolbar.addStretch()
 
         # 批量删除按钮
-        self._btn_batch_del = QPushButton("🗑️ 批量删除")
+        self._btn_batch_del = QPushButton("删除")
         self._btn_batch_del.setObjectName("danger_btn")
         self._btn_batch_del.setCursor(Qt.PointingHandCursor)
         self._btn_batch_del.clicked.connect(self._batch_delete)
         self._btn_batch_del.setVisible(False)
         toolbar.addWidget(self._btn_batch_del)
 
-        self._btn_batch_export = QPushButton("批量导出")
+        self._btn_batch_export = QPushButton("导出")
         self._btn_batch_export.setObjectName("secondary_btn")
         self._btn_batch_export.setCursor(Qt.PointingHandCursor)
         self._btn_batch_export.clicked.connect(self._export_selected_accounts)
@@ -909,20 +924,20 @@ class AccountsPage(QWidget):
         toolbar.addWidget(self._btn_batch_export)
 
         # 操作按钮
-        btn_add = QPushButton(f"➕ {t('accounts.add_account')}")
+        btn_add = QPushButton("➕ 添加")
         btn_add.setObjectName("primary_btn")
         btn_add.setCursor(Qt.PointingHandCursor)
         btn_add.clicked.connect(self._add_account)
         toolbar.addWidget(btn_add)
 
-        btn_import = QPushButton(f"📥 {t('accounts.import_batch')}")
+        btn_import = QPushButton("📥 导入")
         btn_import.setObjectName("secondary_btn")
         btn_import.setCursor(Qt.PointingHandCursor)
         btn_import.clicked.connect(self._import_batch)
         toolbar.addWidget(btn_import)
 
         # 并发数设置
-        toolbar.addWidget(QLabel("并发数:"))
+        toolbar.addWidget(QLabel("并发:"))
         self._concurrency_spin = QSpinBox()
         self._concurrency_spin.setRange(1, 50)
         self._concurrency_spin.setValue(int(load_setting("account_concurrency", "5")))
@@ -933,14 +948,14 @@ class AccountsPage(QWidget):
         self._concurrency_spin.setFixedWidth(80)
         toolbar.addWidget(self._concurrency_spin)
 
-        self._btn_query_all = QPushButton("💎 查询全部积分")
+        self._btn_query_all = QPushButton("💎 查询")
         self._btn_query_all.setObjectName("primary_btn")
         self._btn_query_all.setCursor(Qt.PointingHandCursor)
         self._btn_query_all.clicked.connect(self._query_all_quotas)
         toolbar.addWidget(self._btn_query_all)
 
         # 检查账号状态按钮
-        self._btn_check_status = QPushButton("🔍 检查账号状态")
+        self._btn_check_status = QPushButton("🔍 检查")
         self._btn_check_status.setObjectName("secondary_btn")
         self._btn_check_status.setCursor(Qt.PointingHandCursor)
         self._btn_check_status.setToolTip("批量检测所有账号的 API Key 是否被风控/失效，结果同步到上游 Key 池")
@@ -1214,12 +1229,46 @@ class AccountsPage(QWidget):
         selected = self._get_selected_accounts()
         self._btn_batch_export.setVisible(bool(selected))
         if selected:
-            self._btn_batch_export.setText(f"批量导出 ({len(selected)})")
+            self._btn_batch_export.setText(f"导出({len(selected)})")
         if len(selected) > 1:
             self._btn_batch_del.setVisible(True)
-            self._btn_batch_del.setText(f"🗑️ 批量删除 ({len(selected)})")
+            self._btn_batch_del.setText(f"删除({len(selected)})")
         else:
             self._btn_batch_del.setVisible(False)
+
+    def _on_select_by_status(self, index: int):
+        """按 API 状态一键选中当前页账号"""
+        if index == 0:
+            return  # 占位项，不触发
+
+        page_accounts = self._get_page_accounts()
+        self._table.clearSelection()
+
+        for row, account in enumerate(page_accounts):
+            has_api = bool(account.api_key)
+            is_normal = account.status == AccountStatus.ACTIVE
+            select = False
+            if index == 1:  # 正常
+                select = is_normal
+            elif index == 2:  # 异常
+                select = not is_normal
+            elif index == 3:  # 有API
+                select = has_api
+            elif index == 4:  # 无API
+                select = not has_api
+            elif index == 5:  # 取消选择
+                pass  # select remains False, clearSelection already done
+
+            if select:
+                for col in range(self._table.columnCount()):
+                    self._table.item(row, col).setSelected(True)
+
+        # 复位下拉框
+        self._select_status_combo.blockSignals(True)
+        self._select_status_combo.setCurrentIndex(0)
+        self._select_status_combo.blockSignals(False)
+
+        self._on_selection_changed()
 
     def _show_context_menu(self, pos):
         """右键菜单"""

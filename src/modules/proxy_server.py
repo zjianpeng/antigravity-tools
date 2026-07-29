@@ -60,7 +60,7 @@ SUPPORTED_MODELS = [
     # MiniMax
     "minimax-m3", "minimax-m2.7", "minimax-m2.5",
     # Kimi
-    "kimi-k2.6", "kimi-k2.5", "kimi-k2.7",
+    "kimi-k2.6", "kimi-k2.5", "kimi-k2.7", "kimi-k3",
     # 混元
     "hy3", "hy3-preview", "hunyuan-chat", "hunyuan-2.0-thinking",
 ]
@@ -96,6 +96,7 @@ MODEL_CONTEXT_LENGTHS = {
     "kimi-k2.6": 256000,               # 256K
     "kimi-k2.5": 1000000,              # 百万级上下文
     "kimi-k2.7": 256000,               # 256K
+    "kimi-k3": 1000000,                # 1M 上下文
     # 混元
     "hy3": 256000,                     # 256K
     "hy3-preview": 256000,             # 256K
@@ -2236,19 +2237,27 @@ class ProxyRouter:
         logger.info(f"Key {key_id} 手动恢复为 active")
 
     def mark_key_cooldown(self, key_id: str):
-        """标记 Key 为临时冷却（429 临时限流，10秒后自动恢复）
+        """标记 Key 为临时冷却（429 临时限流，N 秒后自动恢复）
+
+        冷却秒数读取设置项 cooldown_seconds（默认 10，UI 限流冷却可改，即时生效）。
 
         注意：仅用于临时限流（请求过快）。如果是额度耗尽(code 14018)，
         应调用 mark_key_exhausted()，不能自动恢复。
         """
+        try:
+            cooldown_secs = int(load_setting("cooldown_seconds", "10") or "10")
+        except (ValueError, TypeError):
+            cooldown_secs = 10
+        cooldown_secs = max(1, min(cooldown_secs, 3600))  # 限制 1~3600 秒
+
         self._db.update_upstream_key(key_id, {"status": "cooldown"})
         # 立即刷新所有缓存，让 select_key 立刻跳过此 Key
         self._upstream_keys_cache_time = 0
         self._sub_keys_cache_time = 0
-        # 启动后台线程 10 秒后自动恢复
+        # 启动后台线程 N 秒后自动恢复
         import threading
         def _recover():
-            time.sleep(10)
+            time.sleep(cooldown_secs)
             # 检查是否还是 cooldown（避免覆盖其他状态变更）
             keys = self._db.get_upstream_keys()
             for k in keys:
@@ -2260,7 +2269,7 @@ class ProxyRouter:
                     break
         t = threading.Thread(target=_recover, daemon=True)
         t.start()
-        logger.warning(f"Key {key_id} 被限流(429)，进入 10 秒冷却")
+        logger.warning(f"Key {key_id} 被限流(429)，进入 {cooldown_secs} 秒冷却")
 
     def mark_key_rate_limited(self, key_id: str):
         """标记 Key 为系统限流（401/429 系统级限流，不自动恢复）
@@ -2553,6 +2562,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         "supportsImages": _model_supports_images(m),
                         "supportsReasoning": True,
                         "reasoning": {"supportedEfforts": ["max"]},
+                        **_model_context_fields(m),
                     }
                     for m in model_list
                 ]

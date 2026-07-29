@@ -805,12 +805,13 @@ class ApiProxyPage(QWidget):
         self._listen_mode_combo.currentIndexChanged.connect(self._on_listen_mode_changed)
         config_row.addWidget(self._listen_mode_combo)
 
-        config_row.addWidget(QLabel("  "))
+        config_row.addWidget(QLabel("    "))
         config_row.addWidget(QLabel("最低积分:"))
         self._min_credits_spin = QSpinBox()
         self._min_credits_spin.setRange(0, 100000)
         self._min_credits_spin.setValue(int(load_setting("min_credits_threshold", "0")))
         self._min_credits_spin.setSuffix(" 分")
+        self._min_credits_spin.setMinimumWidth(100)
         self._min_credits_spin.setToolTip("低于此积分自动禁用 Key（0=不限制）")
         config_row.addWidget(self._min_credits_spin)
 
@@ -820,20 +821,28 @@ class ApiProxyPage(QWidget):
         self._auto_enable_spin.setRange(0, 100000)
         self._auto_enable_spin.setValue(int(load_setting("auto_enable_threshold", "100")))
         self._auto_enable_spin.setSuffix(" 分")
+        self._auto_enable_spin.setMinimumWidth(100)
         self._auto_enable_spin.setToolTip("查分高于此值自动恢复禁用的 Key")
         config_row.addWidget(self._auto_enable_spin)
 
+        config_row.addWidget(QLabel("  "))
+        config_row.addWidget(QLabel("限流冷却:"))
+        self._cooldown_spin = QSpinBox()
+        self._cooldown_spin.setRange(1, 3600)
+        self._cooldown_spin.setValue(int(load_setting("cooldown_seconds", "10")))
+        self._cooldown_spin.setSuffix(" 秒")
+        self._cooldown_spin.setMinimumWidth(90)
+        self._cooldown_spin.setToolTip("Key 被限流(429)后冷却多少秒再自动恢复")
+        config_row.addWidget(self._cooldown_spin)
+        self._cooldown_spin.valueChanged.connect(
+            lambda v: save_setting("cooldown_seconds", str(v))
+        )
+
+        # 积分阈值变更自动保存并同步
+        self._min_credits_spin.valueChanged.connect(self._apply_thresholds_now)
+        self._auto_enable_spin.valueChanged.connect(self._apply_thresholds_now)
+
         config_row.addStretch()
-
-        self._status_label = QLabel("⏹ 已停止")
-        self._status_label.setStyleSheet("font-weight: 600; color: #9BA4B0;")
-        config_row.addWidget(self._status_label)
-
-        self._toggle_btn = QPushButton("▶ 启动服务")
-        self._toggle_btn.setObjectName("primary_btn")
-        self._toggle_btn.setCursor(Qt.PointingHandCursor)
-        self._toggle_btn.clicked.connect(self._toggle_service)
-        config_row.addWidget(self._toggle_btn)
 
         control_layout.addLayout(config_row)
 
@@ -853,6 +862,17 @@ class ApiProxyPage(QWidget):
         url_row.addWidget(btn_copy_url)
 
         url_row.addStretch()
+
+        self._status_label = QLabel("⏹ 已停止")
+        self._status_label.setStyleSheet("font-weight: 600; color: #9BA4B0;")
+        url_row.addWidget(self._status_label)
+
+        self._toggle_btn = QPushButton("▶ 启动服务")
+        self._toggle_btn.setObjectName("primary_btn")
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.clicked.connect(self._toggle_service)
+        url_row.addWidget(self._toggle_btn)
+
         control_layout.addLayout(url_row)
 
         # 开放模式提示（默认隐藏）
@@ -902,28 +922,52 @@ class ApiProxyPage(QWidget):
 
         keys_layout.addLayout(stats_row)
 
-        # 工具栏 — 从账号导入 + 刷新积分
+        # 工具栏 — 从账号导入 + 刷新积分 + 批量操作
         keys_toolbar = QHBoxLayout()
-        btn_import_from_accounts = QPushButton("📥 从账号导入")
+        keys_toolbar.setSpacing(8)
+        keys_toolbar.setContentsMargins(0, 0, 0, 0)
+        btn_import_from_accounts = QPushButton("📥 导入")
         btn_import_from_accounts.setObjectName("primary_btn")
         btn_import_from_accounts.setCursor(Qt.PointingHandCursor)
         btn_import_from_accounts.setToolTip("从已获取的账号中导入 Token/API Key 到上游 Key 池")
         btn_import_from_accounts.clicked.connect(self._import_from_accounts)
         keys_toolbar.addWidget(btn_import_from_accounts)
 
-        btn_refresh_points = QPushButton("🔄 刷新积分")
+        btn_refresh_points = QPushButton("🔄 积分")
         btn_refresh_points.setObjectName("secondary_btn")
         btn_refresh_points.setCursor(Qt.PointingHandCursor)
         btn_refresh_points.setToolTip("查询所有关联账号的积分并同步到 Key 池")
         btn_refresh_points.clicked.connect(self._refresh_all_points)
         keys_toolbar.addWidget(btn_refresh_points)
 
-        btn_check_status = QPushButton("🔍 一键检测账号状态")
+        btn_check_status = QPushButton("🔍 检测")
         btn_check_status.setObjectName("secondary_btn")
         btn_check_status.setCursor(Qt.PointingHandCursor)
         btn_check_status.setToolTip("批量检测所有上游 Key 是否被风控（403），异常的自动标记")
         btn_check_status.clicked.connect(self._check_all_key_status)
         keys_toolbar.addWidget(btn_check_status)
+
+        # 批量操作
+        btn_batch_perm_disable = QPushButton("🚫 永禁")
+        btn_batch_perm_disable.setObjectName("danger_btn")
+        btn_batch_perm_disable.setCursor(Qt.PointingHandCursor)
+        btn_batch_perm_disable.setToolTip("按积分范围批量永久禁用 Key（不会自动恢复）")
+        btn_batch_perm_disable.clicked.connect(lambda: self._open_batch_status_dialog(enable=False, permanent=True))
+        keys_toolbar.addWidget(btn_batch_perm_disable)
+
+        btn_batch_temp_disable = QPushButton("禁用")
+        btn_batch_temp_disable.setObjectName("secondary_btn")
+        btn_batch_temp_disable.setCursor(Qt.PointingHandCursor)
+        btn_batch_temp_disable.setToolTip("按积分范围批量临时禁用 Key（查分后可自动恢复）")
+        btn_batch_temp_disable.clicked.connect(lambda: self._open_batch_status_dialog(enable=False, permanent=False))
+        keys_toolbar.addWidget(btn_batch_temp_disable)
+
+        btn_batch_enable = QPushButton("✅ 解禁")
+        btn_batch_enable.setObjectName("secondary_btn")
+        btn_batch_enable.setCursor(Qt.PointingHandCursor)
+        btn_batch_enable.setToolTip("按积分范围批量恢复 Key 为可用")
+        btn_batch_enable.clicked.connect(lambda: self._open_batch_status_dialog(enable=True))
+        keys_toolbar.addWidget(btn_batch_enable)
 
         # 当天/总计切换
         self._keys_today_only = False
@@ -1670,6 +1714,62 @@ class ApiProxyPage(QWidget):
             else:
                 QMessageBox.information(self, "导入完成", "没有新的 Key 需要导入（可能已存在）")
 
+    def _apply_thresholds_now(self):
+        """防抖：spinbox 值变时 500ms 后才真正执行"""
+        if not hasattr(self, '_threshold_debounce_timer'):
+            self._threshold_debounce_timer = QTimer()
+            self._threshold_debounce_timer.setSingleShot(True)
+            self._threshold_debounce_timer.timeout.connect(self._do_apply_thresholds)
+        self._threshold_debounce_timer.start(500)
+
+    def _do_apply_thresholds(self):
+        """按当前阈值立即更新所有 Key 状态（不查分，按存的 points 走规则）"""
+        min_val = self._min_credits_spin.value()
+        auto_val = self._auto_enable_spin.value()
+
+        # 1. 阈值持久化到全局 + 每个 Key
+        save_setting("min_credits_threshold", str(min_val))
+        save_setting("auto_enable_threshold", str(auto_val))
+        keys = self._db.get_upstream_keys()
+        for k in keys:
+            self._db.update_upstream_key(k["key_id"], {
+                "min_credits_threshold": float(min_val),
+                "auto_enable_threshold": float(auto_val),
+            })
+
+        # 2. 按存的 points 跑规则
+        disabled_cnt = 0
+        enabled_cnt = 0
+        skipped_no_points = 0
+        for k in keys:
+            status = k.get("status", "active")
+            if status in ("abnormal", "permanent_disabled"):
+                continue  # 不动风控和永久禁用
+            pts_str = k.get("points", "")
+            pts = ApiProxyPage._points_remaining(pts_str)
+            if pts < 0:
+                skipped_no_points += 1
+                continue
+
+            # 积分 <= min → 禁用（只覆盖 active/cooldown/rate_limited/exhausted）
+            if pts <= min_val and status in ("active", "cooldown", "rate_limited", "exhausted"):
+                self._db.update_upstream_key(k["key_id"], {"status": "disabled"})
+                disabled_cnt += 1
+            # 积分 > auto → 恢复 active（不动 abnormal/permanent_disabled）
+            elif pts > auto_val and status == "disabled":
+                self._db.update_upstream_key(k["key_id"], {"status": "active"})
+                enabled_cnt += 1
+
+        self._refresh_upstream_keys()
+        msg = (
+            f"已按阈值同步（min={min_val}, auto={auto_val}）：\n"
+            f"  - 禁用 {disabled_cnt} 个\n"
+            f"  - 启用 {enabled_cnt} 个"
+        )
+        if skipped_no_points:
+            msg += f"\n  - 跳过 {skipped_no_points} 个（无积分数据，需先刷新积分）"
+        QMessageBox.information(self, "按阈值同步", msg)
+
     def _refresh_all_points(self):
         """主动查询所有上游 Key 对应账号的积分并同步（优先用 API Key 直接查分）"""
         from ...modules.api_client import ApiClient
@@ -1914,6 +2014,120 @@ class ApiProxyPage(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self._db.update_upstream_key(key_id, {"status": "permanent_disabled"})
             self._refresh_upstream_keys()
+
+    def _open_batch_status_dialog(self, enable: bool, permanent: bool = True):
+        """批量禁/解禁弹框（enable=False 永久禁用 / enable=True 解禁）"""
+        keys = self._db.get_upstream_keys()
+        if enable:
+            action_text = "批量解禁"
+            status_to = "active"
+            confirm_template = "确定将上述 {n} 个 Key 恢复为可用吗？"
+        elif permanent:
+            action_text = "批量永久禁用"
+            status_to = "permanent_disabled"
+            confirm_template = "确定永久禁用上述 {n} 个 Key 吗？\n（永久禁用后只能手动解禁）"
+        else:
+            action_text = "批量临时禁用"
+            status_to = "disabled"
+            confirm_template = "确定临时禁用上述 {n} 个 Key 吗？\n（查分后可自动恢复）"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(action_text)
+        dlg.setMinimumWidth(420)
+
+        v = QVBoxLayout(dlg)
+
+        # 输入区
+        form = QFormLayout()
+        min_spin = QSpinBox()
+        min_spin.setRange(0, 9_999_999)
+        min_spin.setValue(0 if not enable else 500)
+        form.addRow("最小积分:", min_spin)
+
+        max_spin = QSpinBox()
+        max_spin.setRange(0, 9_999_999)
+        max_spin.setValue(500 if not enable else 100_000)
+        form.addRow("最大积分:", max_spin)
+
+        v.addLayout(form)
+        v.addWidget(QLabel(f"筛选条件：积分（剩余）在上述范围内的 Key\n操作类型：{action_text}"))
+
+        # 预览（实时刷新）
+        preview_label = QLabel("")
+        preview_label.setWordWrap(True)
+        preview_label.setObjectName("preview_label")
+        v.addWidget(preview_label)
+
+        def _refresh_preview():
+            lo, hi = min_spin.value(), max_spin.value()
+            matched = self._filter_keys_by_points(keys, lo, hi, status_to)
+            total = len(keys)
+            skip_count = total - len([k for k in keys if (lo <= ApiProxyPage._points_remaining(k.get("points", "")) <= hi)])
+            already_done = len([k for k in keys if
+                                (lo <= ApiProxyPage._points_remaining(k.get("points", "")) <= hi)
+                                and k.get("status") == status_to
+                                ])
+            preview_label.setText(
+                f"范围匹配 {total - skip_count} 个，将实际生效 <b>{len(matched)}</b> 个"
+                + (f"（{already_done} 个已{'启用' if enable else '永久禁用'}，跳过）" if already_done else "")
+            )
+
+        min_spin.valueChanged.connect(_refresh_preview)
+        max_spin.valueChanged.connect(_refresh_preview)
+        _refresh_preview()
+
+        # 按钮
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        v.addWidget(btn_box)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText(action_text)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        lo, hi = min_spin.value(), max_spin.value()
+        matched = self._filter_keys_by_points(keys, lo, hi, status_to)
+        if not matched:
+            QMessageBox.information(self, "提示", "范围内没有可操作的 Key")
+            return
+
+        # 二次确认
+        reply = QMessageBox.question(
+            self,
+            action_text,
+            confirm_template.format(n=len(matched)) +
+            f"\n积分范围：{lo} ~ {hi}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for k in matched:
+            self._db.update_upstream_key(k["key_id"], {"status": status_to})
+
+        self._refresh_upstream_keys()
+        QMessageBox.information(
+            self, "完成",
+            f"已{'解禁' if enable else '永久禁用'} {len(matched)} 个 Key",
+        )
+
+    @staticmethod
+    def _filter_keys_by_points(keys: list, lo: int, hi: int, target_status: str = None) -> list:
+        """按 points 剩余积分在 [lo, hi] 范围内筛选 Key，排除已处于目标状态的"""
+        result = []
+        for k in keys:
+            if target_status and k.get("status") == target_status:
+                continue  # 已经是目标状态，跳过
+            pts = ApiProxyPage._points_remaining(k.get("points", ""))
+            if pts < 0:
+                continue  # 解析失败的跳过（没有积分数据）
+            if lo <= pts <= hi:
+                result.append(k)
+        return result
 
     def _delete_upstream_key(self, key_id: str):
         """删除上游 Key"""

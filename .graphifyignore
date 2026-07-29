@@ -1,0 +1,22 @@
+# Graphify ignore - Antigravity Tools
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+graphify-out/cache/
+.venv/
+venv/
+*.spec
+version.json
+requirements.txt
+assets/
+docs/
+start.bat
+build.bat
+publish.bat
+rustup-init.exe
+rustup-installer.exe
+README.md
