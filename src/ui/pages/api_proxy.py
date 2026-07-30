@@ -26,7 +26,7 @@ from ...i18n import t
 from ...utils.store import save_setting, load_setting, load_accounts
 from ..styles.theme import LIGHT_THEME, DARK_THEME
 from ...modules.proxy_server import (
-    ProxyServer, SUPPORTED_MODELS, ProxyDatabase, MODEL_CONTEXT_LENGTHS, MODEL_MAX_OUTPUT_TOKENS
+    ProxyServer, ProxyDatabase, MODEL_CONTEXT_LENGTHS, MODEL_MAX_OUTPUT_TOKENS
 )
 
 
@@ -226,6 +226,17 @@ MODEL_NAME_ALIASES = {
     "kimi-k2.7": "Kimi-K2.7-Code",
 }
 
+# 与官方客户端一致的模型列表（id 全小写，顺序同官方下拉）
+# 注：官方 "Kimi-K2.7-Code" 对应本系统的 kimi-k2.7（见 MODEL_ID_ALIASES），不单独加 -code id
+OFFICIAL_MODEL_IDS = [
+    "auto",
+    "hy3",
+    "glm-5.2", "glm-5.1", "glm-5v-turbo",
+    "minimax-m3",
+    "kimi-k3", "kimi-k2.7", "kimi-k2.6",
+    "deepseek-v4-flash", "deepseek-v4-pro",
+]
+
 
 def _normal_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
@@ -412,10 +423,14 @@ class CreateSubKeyDialog(QDialog):
             self._label_input.setText(self._edit_data.get("label", ""))
         layout.addRow("标签:", self._label_input)
 
-        # 允许的模型 — 多选下拉
+        # 允许的模型 — 多选下拉（与官方客户端一致的集合；
+        # 编辑模式下已保存的旧模型附加在末尾，避免静默丢失）
+        saved_models = self._edit_data.get("allowed_models", []) if self._edit_data else []
+        official = [m for m in OFFICIAL_MODEL_IDS if m != "auto"]
+        model_items = official + [m for m in saved_models if m not in official]
         self._model_list_widget = self._create_multi_select(
-            items=["全部模型"] + [m for m in SUPPORTED_MODELS if m != "auto"],
-            selected=self._edit_data.get("allowed_models", []) if self._edit_data else [],
+            items=["全部模型"] + model_items,
+            selected=saved_models,
             all_option="全部模型",
         )
         layout.addRow("限制模型:", self._model_list_widget)
@@ -2562,15 +2577,8 @@ class ApiProxyPage(QWidget):
 
     # ─── 一键配置 WorkBuddy / CodeBuddy ───
 
-    SUPPORTED_CONFIG_MODELS = [
-        "hy3", "hy3-preview", "hunyuan-chat", "hunyuan-2.0-thinking",
-        "deepseek-v4-pro", "deepseek-v4-flash",
-        "deepseek-v3-2-volc", "deepseek-v3-1", "deepseek-v3-0324", "deepseek-r1",
-        "glm-5.2", "glm-5.1", "glm-5.0", "glm-5.0-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.6",
-        "kimi-k2.6", "kimi-k2.5", "kimi-k2.7",
-        "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-        "auto",
-    ]
+    # 与官方客户端一致的模型集合（含 auto），见模块级 OFFICIAL_MODEL_IDS
+    SUPPORTED_CONFIG_MODELS = OFFICIAL_MODEL_IDS
 
     # 模型显示名（按截图大小写处理；未列出的模型显示名等于 id）
     # 注意：图片文件名使用小写 id，与此处显示名解耦
@@ -2602,6 +2610,7 @@ class ApiProxyPage(QWidget):
         "kimi-k2.6":                (True,  True,  True),
         "kimi-k2.5":                (True,  True,  True),
         "kimi-k2.7":                (True,  True,  True),
+        "kimi-k3":                  (True,  True,  True),
         "minimax-m3":               (True,  True,  True),
         "minimax-m2.7":             (True,  True,  True),
         "minimax-m2.5":             (True,  True,  True),

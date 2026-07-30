@@ -1579,7 +1579,7 @@ class AccountsPage(QWidget):
         class StatusCheckWorker(QThread):
             """后台并发检测 API Key 风控状态线程"""
             progress = QSignal(str, bool, str)  # nickname, success, status_text
-            done = QSignal(int, int, int, list, list)  # (正常, 异常, 失败, 异常key列表, 限流key列表)
+            done = QSignal(int, int, int, list, list, list)  # (正常, 异常, 失败, 异常key列表, 限流key列表, 正常key列表)
 
             def __init__(self, accounts, max_workers=5):
                 super().__init__()
@@ -1611,6 +1611,7 @@ class AccountsPage(QWidget):
                 failed = 0
                 abnormal_keys = []
                 rate_limited_keys = []
+                ok_keys = []
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {executor.submit(self._check_one, acc): acc
                                for acc in self._accounts}
@@ -1629,11 +1630,12 @@ class AccountsPage(QWidget):
                                 rate_limited_keys.append(api_key)
                             elif success:
                                 normal += 1
+                                ok_keys.append(api_key)
                             else:
                                 failed += 1
                         except Exception:
                             failed += 1
-                self.done.emit(normal, abnormal, failed, abnormal_keys, rate_limited_keys)
+                self.done.emit(normal, abnormal, failed, abnormal_keys, rate_limited_keys, ok_keys)
 
         worker = StatusCheckWorker(accounts_with_key, max_workers=max_workers)
 
@@ -1643,7 +1645,7 @@ class AccountsPage(QWidget):
             icon = "✅" if success else ("⚠️" if status_text in ("风控异常", "限流(401)") else "❌")
             self._append_log(f"{icon} {nickname} → {status_text}")
 
-        def _on_done(normal, abnormal, failed, abnormal_keys, rate_limited_keys):
+        def _on_done(normal, abnormal, failed, abnormal_keys, rate_limited_keys, ok_keys):
             self._btn_check_status.setEnabled(True)
             self._btn_query_all.setEnabled(True)
             self._btn_stop_query.setVisible(False)
@@ -1672,6 +1674,28 @@ class AccountsPage(QWidget):
                 self._append_log("✅ 上游 Key 池已同步")
             except Exception as e:
                 self._append_log(f"⚠️ 同步上游池失败: {e}")
+
+            # 检测结果写回账号表（状态列/按状态全选 依赖它）
+            try:
+                from ...utils.store import update_account_status
+                key_to_uid = {a.api_key: a.uid for a in accounts_with_key}
+                for api_key in abnormal_keys:
+                    uid = key_to_uid.get(api_key)
+                    if uid:
+                        update_account_status(uid, AccountStatus.ERROR, "风控异常")
+                for api_key in rate_limited_keys:
+                    uid = key_to_uid.get(api_key)
+                    if uid:
+                        update_account_status(uid, AccountStatus.ERROR, "限流(401)")
+                for api_key in ok_keys:
+                    uid = key_to_uid.get(api_key)
+                    if uid:
+                        update_account_status(uid, AccountStatus.ACTIVE, "")
+                self._load_accounts()
+                self._apply_filter()
+                self._render_page()
+            except Exception as e:
+                self._append_log(f"⚠️ 写回账号状态失败: {e}")
 
             rate_limited_count = len(rate_limited_keys)
             msg = f"检测完成：✅ 正常 {normal} 个"

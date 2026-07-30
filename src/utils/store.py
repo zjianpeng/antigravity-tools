@@ -223,6 +223,19 @@ def load_accounts(platform: Optional[Platform] = None) -> list[Account]:
         conn.close()
 
 
+def update_account_status(uid: str, status: AccountStatus, reason: str = ""):
+    """只更新账号状态字段（不全列覆写，避免覆盖其他并发更新）"""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE accounts SET status = ?, status_reason = ? WHERE uid = ?",
+            (status.value, reason, uid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def delete_account(uid: str):
     """删除账号"""
     conn = get_connection()
