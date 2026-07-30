@@ -55,9 +55,8 @@ PUBLIC_API_PATHS = {
     "activity_banner": "/v2/activity/banner",
 }
 
-# Keycloak token refresh 端点
-KEYCLOAK_TOKEN_URL = "https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/token"
-KEYCLOAK_CLIENT_ID = "console"
+# token 续期口（桌面端同款，实测可用；Keycloak 直连 refresh 恒 401，死路）
+TOKEN_REFRESH_URL = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
 
 
 def _retry_delay(attempt: int) -> float:
@@ -415,7 +414,12 @@ class ApiClient:
         return None
 
     def _refresh_token(self) -> bool:
-        """刷新 Keycloak access token
+        """刷新 access token（走 console 后端续期口，2026-07-30 实测）
+
+        桌面端同款接口（WorkBuddy 日志实锤）：只需 X-Refresh-Token 一个头。
+        RT 无旋转无次数限制，每次刷新重新计 120 天。
+        注意：Keycloak 标准 refresh（grant_type=refresh_token + client_id=console）
+        恒 401 unauthorized_client（confidential client，secret 在 APISIX 网关）——死路勿回退。
 
         Returns:
             是否刷新成功
@@ -423,18 +427,23 @@ class ApiClient:
         if not self.refresh_token:
             return False
 
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": KEYCLOAK_CLIENT_ID,
-        }
-
         try:
-            resp = self.session.post(KEYCLOAK_TOKEN_URL, data=data, timeout=15)
+            resp = self.session.post(
+                TOKEN_REFRESH_URL,
+                json={},
+                headers={"X-Refresh-Token": self.refresh_token},
+                timeout=15,
+            )
             if resp.status_code == 200:
-                result = resp.json()
-                self.access_token = result["access_token"]
-                self.refresh_token = result.get("refresh_token", self.refresh_token)
+                result = resp.json().get("data") or {}
+                if not result.get("accessToken"):
+                    logger.warning(f"Token 刷新响应缺 accessToken: {resp.text[:100]}")
+                    return False
+                old_token = self.access_token
+                self.access_token = result["accessToken"]
+                self.refresh_token = result.get("refreshToken", self.refresh_token)
+                self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                self._persist_tokens(old_token)
                 logger.info("Token 刷新成功")
                 return True
             else:
@@ -443,6 +452,51 @@ class ApiClient:
         except Exception as e:
             logger.error(f"Token 刷新异常: {e}")
             return False
+
+    def _persist_tokens(self, old_token: str = ""):
+        """刷新成功后持久化新 token（不持久化的话，重启后续期链就断了）
+
+        1. 回写 accounts 表（auth_token + auth_raw）；
+        2. 同步内存中的 Account 对象；
+        3. 上游 Key 池里持有旧 token 的 Key 一并换成新 token
+           （旧 token 不吊销、到期前仍可用，但池与账号保持一致更干净）。
+        任何一步失败只记日志，不影响本次会话（内存 token 已是新的）。
+        """
+        if not self.account or not self.account.uid:
+            return
+
+        try:
+            from ..utils.store import update_account_tokens
+            update_account_tokens(self.account.uid, self.access_token, self.refresh_token)
+        except Exception as e:
+            logger.error(f"Token 回写 accounts 表失败 uid={self.account.uid}: {e}")
+
+        # 内存 Account 同步，避免调用方拿到旧 token
+        self.account.auth_token = self.access_token
+        try:
+            raw = json.loads(self.account.auth_raw) if self.account.auth_raw else {}
+        except ValueError:
+            raw = {}
+        raw["accessToken"] = self.access_token
+        if self.refresh_token:
+            raw["refreshToken"] = self.refresh_token
+        self.account.auth_raw = json.dumps(raw)
+
+        # 池里的 Key 同步换新（懒加载 proxy_server，避免模块级耦合）
+        if old_token and old_token != self.access_token:
+            try:
+                from .proxy_server import ProxyDatabase
+                proxy_db = ProxyDatabase.get_instance()
+                synced = 0
+                for k in proxy_db.get_upstream_keys():
+                    if k.get("api_key") == old_token:
+                        proxy_db.update_upstream_key(k.get("key_id", ""), {"api_key": self.access_token})
+                        synced += 1
+                if synced:
+                    proxy_db._flush_to_disk()
+                    logger.info(f"上游 Key 池已同步新 token（{synced} 个 Key）")
+            except Exception as e:
+                logger.error(f"上游 Key 池同步新 token 失败: {e}")
 
     # === 积分查询 API ===
 
@@ -636,10 +690,18 @@ class ApiClient:
         Returns:
             ApiClient 实例
         """
+        # 从 auth_raw（{"accessToken":..., "refreshToken":...}）抠 refresh_token 用于自动续期
+        refresh_token = ""
+        if account.auth_raw:
+            try:
+                refresh_token = json.loads(account.auth_raw).get("refreshToken", "")
+            except (ValueError, AttributeError):
+                pass
         return ApiClient(
             access_token=account.auth_token,
             uid=account.uid,
             domain=account.domain or "www.codebuddy.cn",
+            refresh_token=refresh_token,
             proxy=proxy,
             account=account,
         )

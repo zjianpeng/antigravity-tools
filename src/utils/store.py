@@ -236,6 +236,52 @@ def update_account_status(uid: str, status: AccountStatus, reason: str = ""):
         conn.close()
 
 
+def update_account_tokens(uid: str, access_token: str, refresh_token: str = ""):
+    """只更新账号的 JWT token 字段（不全列覆写，避免覆盖其他并发更新）
+
+    续期成功后回写：auth_token = 新 accessToken；
+    auth_raw 在原 JSON 基础上合并更新 accessToken/refreshToken（保留其他既有字段）。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT auth_raw FROM accounts WHERE uid = ?", (uid,)).fetchone()
+        if row is None:
+            return
+        raw = {}
+        try:
+            raw = json.loads(row["auth_raw"]) if row["auth_raw"] else {}
+        except ValueError:
+            raw = {}
+        raw["accessToken"] = access_token
+        if refresh_token:
+            raw["refreshToken"] = refresh_token
+        conn.execute(
+            "UPDATE accounts SET auth_token = ?, auth_raw = ? WHERE uid = ?",
+            (access_token, json.dumps(raw), uid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def find_account_by_token(token: str) -> Optional[Account]:
+    """按 auth_token 或 auth_raw 里的 accessToken 反查账号（JWT 续期时取 refreshToken 用）
+
+    auth_raw 是 JSON 字符串，JWT 足够长且随机，LIKE 误命中概率为零。
+    """
+    if not token:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE auth_token = ? OR auth_raw LIKE ? LIMIT 1",
+            (token, f"%{token}%"),
+        ).fetchone()
+        return _row_to_account(row) if row else None
+    finally:
+        conn.close()
+
+
 def delete_account(uid: str):
     """删除账号"""
     conn = get_connection()

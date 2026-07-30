@@ -14,6 +14,16 @@ from ...i18n import t
 # 更新日志数据：新版本加在最前面
 CHANGELOG = [
     {
+        "version": "2.1.0",
+        "date": "2026-07-30",
+        "items": [
+            "账号管理：新增「Token 导入」——按 昵称----accessToken----refreshToken 格式批量导入 JWT 账号（refreshToken 可省，昵称省略时自动从 token 识别手机号）",
+            "账号管理：JWT 账号支持无限续期——access token 90 天、refresh token 120 天双有效期，到期自动换新并写回本地，重启软件续期链不中断",
+            "API 代理：上游 Key 池的 JWT Key 到期前自动续期——转发请求与池检测前都会检查有效期，临期自动换新，Key 池与账号表同步更新",
+            "账号管理：批量状态检测覆盖纯 Token 账号——没有 API Key、只有 Token 的账号也能检测风控状态，检测前自动续期，避免可续期账号被误判为限流",
+        ],
+    },
+    {
         "version": "2.0.1",
         "date": "2026-07-30",
         "items": [

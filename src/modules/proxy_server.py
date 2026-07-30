@@ -692,6 +692,153 @@ def _build_workbuddy_relay_headers(api_key: str) -> dict:
     }
 
 
+def _decode_jwt_exp(token: str) -> Optional[float]:
+    """解码 JWT payload 的 exp 时间戳（不验签，仅本地读有效期；失败返回 None）"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # base64url 补 padding
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get("exp")
+        return float(exp) if exp else None
+    except Exception:
+        return None
+
+
+def _refresh_jwt_tokens(refresh_token: str) -> Optional[tuple]:
+    """调 codebuddy 续期口换新 token（桌面端同款接口，2026-07-30 实测可用）。
+
+    RT 无旋转无次数限制，每次刷新 access/refresh 双钟重置（90 天/120 天）。
+    成功返回 (accessToken, refreshToken)；失败返回 None。
+    """
+    from .api_client import TOKEN_REFRESH_URL
+    try:
+        resp = requests.post(
+            TOKEN_REFRESH_URL,
+            json={},
+            headers={"X-Refresh-Token": refresh_token},
+            timeout=15,
+            proxies={"http": None, "https": None},  # 绕过系统代理，直连
+        )
+        if resp.status_code != 200:
+            logger.warning(f"[JWT续期] 续期口返回 {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json().get("data") or {}
+        access = data.get("accessToken", "")
+        if not access:
+            logger.warning(f"[JWT续期] 续期响应缺 accessToken: {resp.text[:200]}")
+            return None
+        return access, data.get("refreshToken") or refresh_token
+    except Exception as e:
+        logger.error(f"[JWT续期] 请求异常: {e}")
+        return None
+
+
+def ensure_fresh_jwt(account) -> str:
+    """返回账号当前可用的 access token（账号侧路径用：批量状态检测等）。
+
+    - 非 JWT / 剩余有效期 > 1 天：原样返回，零开销；
+    - JWT 临期或已过期且有 refreshToken：先续期、回写 accounts 表、同步内存 Account，返回新 token；
+    - 续期失败：记日志返回旧 token，让调用方照常走（旧 token 到期前仍可用）。
+    阈值与 relay 路径 maybe_refresh_jwt_key 一致（1 天）。
+    """
+    token = (account.auth_token or "") if account else ""
+    if not token.startswith("eyJ"):
+        return token
+    exp = _decode_jwt_exp(token)
+    if exp is None or exp - time.time() > 86400:
+        return token
+
+    refresh_token = ""
+    try:
+        refresh_token = json.loads(account.auth_raw).get("refreshToken", "") if account.auth_raw else ""
+    except ValueError:
+        refresh_token = ""
+    if not refresh_token:
+        return token
+
+    result = _refresh_jwt_tokens(refresh_token)
+    if not result:
+        return token
+    new_access, new_refresh = result
+    try:
+        from ..utils.store import update_account_tokens
+        update_account_tokens(account.uid, new_access, new_refresh)
+        account.auth_token = new_access
+        try:
+            raw = json.loads(account.auth_raw) if account.auth_raw else {}
+        except ValueError:
+            raw = {}
+        raw["accessToken"] = new_access
+        if new_refresh:
+            raw["refreshToken"] = new_refresh
+        account.auth_raw = json.dumps(raw)
+        logger.info(f"[JWT续期] 账号侧续期成功 uid={account.uid}")
+    except Exception as e:
+        logger.error(f"[JWT续期] 账号侧续期回写失败 uid={getattr(account, 'uid', '?')}: {e}")
+    return new_access
+
+
+def refresh_pool_jwt_key(db, key: dict, ahead_secs: float = 86400) -> str:
+    """池里的 JWT key 临期/过期时续期（池检测、relay 共用）。
+
+    - 非 JWT / 剩余有效期 > ahead_secs：原样返回 key 里的 api_key，零开销；
+    - 临期/已过期：从 accounts 表反查 refreshToken 走续期口换新，
+      同步更新池 key（立即刷盘）与 accounts 表（续期链不断），返回新 token；
+    - 失败（无账号/无 RT/网络异常）：记日志并原样返回旧 token。
+    不做锁与失败冷却——并发控制由调用方负责（relay 路径在 maybe_refresh_jwt_key 里做）。
+    """
+    api_key = key.get("api_key", "")
+    if not api_key.startswith("eyJ"):
+        return api_key
+    exp = _decode_jwt_exp(api_key)
+    if exp is None or exp - time.time() > ahead_secs:
+        return api_key
+
+    key_id = key.get("key_id", "")
+    label = key.get("label", key_id[:8])
+    hours_left = (exp - time.time()) / 3600
+    logger.info(f"[JWT续期] Key {label} 剩余 {hours_left:.1f}h，开始续期...")
+
+    # 反查账号拿 refreshToken（账号被删 / 导入时没带 RT 就没法续）
+    from ..utils.store import find_account_by_token, update_account_tokens
+    account = None
+    try:
+        account = find_account_by_token(api_key)
+    except Exception as e:
+        logger.error(f"[JWT续期] 反查账号失败: {e}")
+    refresh_token, uid = "", ""
+    if account:
+        uid = account.uid
+        try:
+            refresh_token = json.loads(account.auth_raw).get("refreshToken", "") if account.auth_raw else ""
+        except ValueError:
+            refresh_token = ""
+    if not refresh_token:
+        logger.warning(f"[JWT续期] Key {label} 找不到可用 refreshToken（账号不存在或未导入 RT），沿用旧 token")
+        return api_key
+
+    result = _refresh_jwt_tokens(refresh_token)
+    if not result:
+        return api_key
+    new_access, new_refresh = result
+
+    # 1) 更新 Key 池并立即刷盘（防崩溃丢新 token）
+    db.update_upstream_key(key_id, {"api_key": new_access})
+    db._flush_to_disk()
+    key["api_key"] = new_access  # 调用方本次直接用新 token
+    # 2) 回写 accounts 表，续期链不断
+    if uid:
+        try:
+            update_account_tokens(uid, new_access, new_refresh)
+        except Exception as e:
+            logger.error(f"[JWT续期] 回写 accounts 表失败 uid={uid}: {e}")
+    logger.info(f"[JWT续期] Key {label} 续期成功，Key 池与 accounts 表已同步")
+    return new_access
+
+
 _SYSTEM_PROMPT_REPLACEMENT_CACHE = {
     "raw": "",
     "pattern": None,
@@ -1206,7 +1353,9 @@ class ProxyDatabase:
             if not self._dirty:
                 return
             try:
-                tmp_path = self._db_path + ".tmp"
+                # 临时文件名带进程 PID：多实例同时 flush 时各写各的 tmp，
+                # 避免 A 把 B 的 tmp rename 走后，B 报 No such file or directory
+                tmp_path = f"{self._db_path}.{os.getpid()}.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(self._data, f, ensure_ascii=False, indent=2)
                 # 原子 rename（Windows 上 os.replace 是原子的）
@@ -1772,6 +1921,9 @@ class ProxyRouter:
         # 健康检测后台线程（优化项 #17）
         self._health_check_stop = threading.Event()
         self._health_check_thread: Optional[threading.Thread] = None
+        # JWT 续期（优化：JWT 上游 Key 到期前自动换新）
+        self._jwt_refresh_lock = threading.Lock()      # 同一时刻只允许一个续期请求
+        self._jwt_refresh_fail_at: dict[str, float] = {}  # {key_id: 上次失败时间戳} 失败冷却，避免每请求都打续期口
 
     def _get_session(self, base_url: str) -> requests.Session:
         """获取或创建到指定上游的 Session（连接池复用）"""
@@ -1795,6 +1947,51 @@ class ProxyRouter:
                 self._sessions[domain] = session
                 logger.info(f"创建上游连接池: {domain}")
             return self._sessions[domain]
+
+    # JWT 续期阈值：剩余有效期低于 1 天就提前换新（access token 寿命 90 天）
+    _JWT_REFRESH_AHEAD_SECS = 86400
+    # 续期失败冷却：10 分钟内不对同一 Key 重复打续期口
+    _JWT_REFRESH_FAIL_COOLDOWN = 600
+
+    def maybe_refresh_jwt_key(self, key: dict) -> str:
+        """JWT 上游 Key 到期前主动续期，返回可用的 api_key。
+
+        - 非 JWT（ck_ 卡密等）：原样返回，零开销；
+        - JWT 剩余 > 1 天：原样返回；
+        - JWT 临期/已过期：从 accounts 表反查 refreshToken 走续期口换新，
+          同步更新 Key 池与 accounts 表（续期链不断），返回新 token；
+        - 续期失败：记日志并沿用旧 token（旧 token 未吊销，到期前仍可用）。
+        """
+        api_key = key.get("api_key", "")
+        if not api_key.startswith("eyJ"):
+            return api_key
+        exp = _decode_jwt_exp(api_key)
+        if exp is None or exp - time.time() > self._JWT_REFRESH_AHEAD_SECS:
+            return api_key
+
+        key_id = key.get("key_id", "")
+
+        # 失败冷却：不打爆续期口
+        if time.time() - self._jwt_refresh_fail_at.get(key_id, 0) < self._JWT_REFRESH_FAIL_COOLDOWN:
+            return api_key
+
+        with self._jwt_refresh_lock:
+            # 拿锁后复查：别的线程可能刚续完，池里已是新 token
+            for k in self._db.get_upstream_keys():
+                if k.get("key_id") == key_id:
+                    current = k.get("api_key", "")
+                    if current != api_key:
+                        cur_exp = _decode_jwt_exp(current)
+                        if cur_exp and cur_exp - time.time() > self._JWT_REFRESH_AHEAD_SECS:
+                            key["api_key"] = current
+                            return current
+                    break
+
+            new_key = refresh_pool_jwt_key(self._db, key, ahead_secs=self._JWT_REFRESH_AHEAD_SECS)
+            if new_key == api_key:
+                # 没换成（无 RT / 续期口失败）→ 记失败冷却
+                self._jwt_refresh_fail_at[key_id] = time.time()
+            return new_key
 
     def select_key(self, model: str, allowed_key_ids: list = None, exclude: set = None,
                    key_mode: int = 1, request_data: dict = None) -> Optional[dict]:
@@ -2843,7 +3040,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
             try:
                 # ─── v1.6.6 WorkBuddy Relay：保留客户端 body，只替换上游 Key ───
-                upstream_api_key = upstream_key.get("api_key", "")
+                # JWT Key 临期自动续期（ck_ 卡密零开销直接返回）
+                upstream_api_key = self.router.maybe_refresh_jwt_key(upstream_key)
                 req_headers = _build_workbuddy_relay_headers(upstream_api_key)
                 client_wants_stream = request_data.get("stream", False)
                 upstream_request_data, build_meta = _build_workbuddy_relay_body(request_data)
@@ -3223,7 +3421,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         }
 
         try:
-            api_key = upstream_key.get("api_key", "")
+            # JWT Key 临期自动续期（ck_ 卡密零开销直接返回）
+            api_key = self.router.maybe_refresh_jwt_key(upstream_key)
             resp = self.router._get_session(upstream_url).post(
                 f"{upstream_url}{UPSTREAM_CHAT_PATH}",
                 json=summary_request,

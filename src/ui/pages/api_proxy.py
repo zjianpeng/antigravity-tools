@@ -618,7 +618,7 @@ class ImportFromAccountsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        hint = QLabel("选择已有账号导入到上游 Key 池。只有含 API Key 的账号才可导入。已导入的会默认勾选。")
+        hint = QLabel("选择已有账号导入到上游 Key 池。含 API Key（ck_卡密）或 Token 的账号均可导入，优先使用 API Key。已导入的会默认勾选。")
         hint.setStyleSheet("color: #718096; font-size: 12px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1940,6 +1940,11 @@ class ApiProxyPage(QWidget):
             def _check_one(self, k):
                 api_key = k.get("api_key", "")
                 label = k.get("label", api_key[:12])
+                # JWT 临期/过期先续期再检测（池 key 与 accounts 表同步换新），
+                # 避免可续期的 Key 被 401 误判成限流
+                if api_key.startswith("eyJ"):
+                    from ...modules.proxy_server import refresh_pool_jwt_key
+                    api_key = refresh_pool_jwt_key(self._db, k)
                 self.progress.emit(f"检测 {label}...")
                 result = check_api_key_chat_status(api_key, attempts=3)
                 return k, label, result

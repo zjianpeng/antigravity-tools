@@ -1,6 +1,7 @@
 """账号管理页面"""
 
 import secrets
+import json
 import logging
 import urllib.request
 from datetime import datetime
@@ -99,13 +100,13 @@ class AddAccountDialog(QDialog):
 
         layout.addRow(btn_row2)
 
-        # 第三行按钮：用API导入
+        # 第三行按钮：Token导入 + 卡密导入
         btn_row3 = QHBoxLayout()
 
-        btn_api = QPushButton("🔑 用API导入")
+        btn_api = QPushButton("🎫 Token导入")
         btn_api.setObjectName("secondary_btn")
-        btn_api.setToolTip("直接输入 API Key (ck_xxx) 导入账号")
-        btn_api.clicked.connect(self._import_from_api)
+        btn_api.setToolTip("粘贴 JWT Token 或 手机号----access----refresh 整行导入账号")
+        btn_api.clicked.connect(self._import_from_token)
         btn_row3.addWidget(btn_api)
 
         btn_card = QPushButton("卡密导入")
@@ -362,47 +363,43 @@ class AddAccountDialog(QDialog):
         dialog.accounts_imported.connect(self._on_batch_accounts_imported)
         dialog.exec()
 
-    def _import_from_api(self):
-        """用 API Key (ck_xxx) 直接导入账号 — 弹自定义对话框输入 Key + 昵称 + UID"""
-        from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QVBoxLayout
+    @staticmethod
+    def _decode_jwt_uid(token: str):
+        """解码 JWT payload → (uid, preferred_username)。失败返回 ('', '')。"""
+        import base64 as _b64
+        try:
+            part = token.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            payload = json.loads(_b64.urlsafe_b64decode(part))
+            return payload.get("sub", ""), payload.get("preferred_username", "")
+        except Exception:
+            return "", ""
+
+    def _import_from_token(self):
+        """粘贴 JWT 批量导入（卡密同款），格式：昵称----accessToken----refreshToken。
+
+        refreshToken 可省（省了就不能自动续期）；昵称也可省（自动取 token 里的手机号）。
+        纯 JWT 账号：api_key 留空，上游 Key 池自动回退用 auth_token（裸 JWT 转发可用）。
+        """
+        from PySide6.QtWidgets import QDialogButtonBox, QVBoxLayout
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("🔑 用API导入")
-        dialog.setMinimumWidth(450)
+        dialog.setWindowTitle("🎫 Token导入")
+        dialog.setMinimumSize(520, 360)
         dlg_layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-        form.setSpacing(12)
 
-        key_input = QLineEdit()
-        key_input.setPlaceholderText("ck_xxx 格式")
-        key_input.setMinimumWidth(350)
-        form.addRow("API Key *:", key_input)
-
-        nickname_input = QLineEdit()
-        nickname_input.setPlaceholderText("用于显示（如手机号）")
-        form.addRow("昵称 *:", nickname_input)
-
-        uid_input = QLineEdit()
-        uid_input.setPlaceholderText("账号唯一标识（如手机号）")
-        form.addRow("UID *:", uid_input)
-
-        dlg_layout.addLayout(form)
-
-        hint = QLabel("提示：输入 API Key 后会自动验证并查积分，昵称和 UID 必填")
+        hint = QLabel("每行一个账号，格式：昵称----accessToken----refreshToken（refreshToken 可省；昵称省略时自动从 token 识别手机号）")
         hint.setStyleSheet("color: #9BA4B0; font-size: 12px;")
         hint.setWordWrap(True)
         dlg_layout.addWidget(hint)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
-            parent=dialog
-        )
-        btn_ok = buttons.button(QDialogButtonBox.Ok)
-        btn_ok.setText("验证并导入")
-        btn_ok.setObjectName("primary_btn")
-        btn_cancel = buttons.button(QDialogButtonBox.Cancel)
-        btn_cancel.setText(t("common.cancel"))
-        btn_cancel.setObjectName("secondary_btn")
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("14797525290----eyJhbGciOi...----eyJhbGciOiJIUzUx...\n13800138000----eyJhbGciOi...")
+        dlg_layout.addWidget(text_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.button(QDialogButtonBox.Ok).setText("导入")
+        buttons.button(QDialogButtonBox.Cancel).setText(t("common.cancel"))
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         dlg_layout.addWidget(buttons)
@@ -410,70 +407,60 @@ class AddAccountDialog(QDialog):
         if dialog.exec() != QDialog.Accepted:
             return
 
-        api_key = key_input.text().strip()
-        nickname = nickname_input.text().strip()
-        uid = uid_input.text().strip()
+        accounts = []
+        invalid = []
+        for line_no, raw_line in enumerate(text_edit.toPlainText().splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("----")]
+            access_token, refresh_token, nickname = "", "", ""
+            if len(parts) == 1:
+                access_token = parts[0]
+            elif len(parts) == 2:
+                nickname, access_token = parts
+            elif len(parts) == 3:
+                nickname, access_token, refresh_token = parts
+            else:
+                invalid.append(str(line_no))
+                continue
+            if not access_token.startswith("eyJ"):
+                invalid.append(str(line_no))
+                continue
+            uid, username = self._decode_jwt_uid(access_token)
+            if not uid:
+                invalid.append(str(line_no))
+                continue
+            if not nickname:
+                nickname = username or uid[:12]
+            accounts.append({
+                "uid": uid,
+                "nickname": nickname,
+                "auth_token": access_token,
+                "auth_raw": json.dumps({"accessToken": access_token, "refreshToken": refresh_token}),
+                "api_key": "",
+                "domain": "www.codebuddy.cn",
+                "ck": "",
+                "platform": Platform.CODEBUDDY,
+            })
 
-        if not api_key:
-            QMessageBox.warning(self, t("common.warning"), "请输入 API Key")
+        if not accounts:
+            QMessageBox.warning(self, t("common.warning"), "没有可导入的 Token，请检查格式：昵称----accessToken----refreshToken")
             return
-        if not api_key.startswith("ck_"):
-            QMessageBox.warning(self, t("common.warning"), "API Key 应以 ck_ 开头")
-            return
-        if not nickname or not uid:
-            QMessageBox.warning(self, t("common.warning"), "昵称和 UID 必填")
-            return
 
-        self._status_label.setText("⏳ 正在验证 API Key...")
-        self._status_label.setStyleSheet("color: #D69E2E; font-size: 12px;")
+        if invalid:
+            reply = QMessageBox.question(
+                self,
+                "格式提醒",
+                f"有 {len(invalid)} 行格式不正确或 token 无法解码，将跳过这些行并继续导入吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
-        # 用 API Key 查分验证有效性
-        remaining = 0
-        total = 0
-        try:
-            from ...modules.api_client import ApiClient
-            client = ApiClient.from_api_key(api_key)
-            result = client.get_user_resource()
-            if result and result.get("success"):
-                remaining = result.get("remaining_credits", 0)
-                total = result.get("total_credits", 0)
-        except Exception as e:
-            self._status_label.setText(f"⚠️ 验证失败: {e}（仍可保存）")
-            self._status_label.setStyleSheet("color: #D69E2E; font-size: 12px;")
-
-        # 填充表单
-        self._token_input.setText(api_key)
-        self._uid_input.setText(uid)
-        self._nickname_input.setText(nickname)
-
-        # 同步导入到上游 Key 池（立即写盘）
-        try:
-            from ...modules.proxy_server import ProxyDatabase
-            proxy_db = ProxyDatabase.get_instance()
-            existing = {k.get("api_key", "") for k in proxy_db.get_upstream_keys()}
-            if api_key not in existing:
-                import secrets as _sec
-                proxy_db.add_upstream_key({
-                    "key_id": f"ck_{_sec.token_hex(4)}",
-                    "api_key": api_key,
-                    "label": uid,
-                    "status": "active",
-                    "points": f"{remaining:.0f}/{total:.0f}" if total > 0 else "",
-                    "points_updated_at": "",
-                    "packages": [],
-                    "created_at": "",
-                })
-                proxy_db._dirty = True
-                proxy_db._flush_to_disk()
-        except Exception:
-            pass
-
-        status = f"✅ API Key 已验证: {nickname} ({uid})"
-        if total > 0:
-            status += f"  积分: {remaining:.0f}/{total:.0f}"
-        status += "\n已填充表单并导入上游Key池，点击「保存」完成"
-        self._status_label.setText(status)
-        self._status_label.setStyleSheet("color: #38A169; font-size: 12px;")
+        self._on_batch_accounts_imported(accounts)
+        QMessageBox.information(self, "导入完成", f"已导入 {len(accounts)} 个账号")
 
     def _import_card_keys(self):
         """粘贴卡密批量导入，格式：昵称----apikey。"""
@@ -550,6 +537,7 @@ class AddAccountDialog(QDialog):
             return
 
         key_pool_count = 0
+        key_pool_error = ""
 
         # 1. 批量导入到上游Key池（一次写磁盘）
         try:
@@ -582,8 +570,9 @@ class AddAccountDialog(QDialog):
                     proxy_db.add_upstream_key(key_data)
                     existing_api_keys.add(api_key)
                     key_pool_count += 1
-        except Exception:
-            pass  # Key池导入失败不影响账号导入
+        except Exception as e:
+            logger.exception("自动同步上游 Key 池失败")
+            key_pool_error = str(e)  # 不吞错：记录日志并在下方状态栏提示
 
         # 2. 保存账号到数据库
         count = 0
@@ -594,6 +583,7 @@ class AddAccountDialog(QDialog):
                 nickname=acc_data.get("nickname", ""),
                 platform=acc_data.get("platform", Platform.CODEBUDDY),
                 auth_token=acc_data.get("auth_token", ""),
+                auth_raw=acc_data.get("auth_raw", ""),
                 domain=acc_data.get("domain", "www.codebuddy.cn"),
                 ck=acc_data.get("ck", ""),
                 api_key=acc_data.get("api_key", ""),
@@ -608,6 +598,12 @@ class AddAccountDialog(QDialog):
             msg = f"✅ 已导入 {count} 个账号"
             if key_pool_count > 0:
                 msg += f"\n🔑 已同步 {key_pool_count} 个 Key 到上游 Key 池"
+            if key_pool_error:
+                msg += f"\n⚠️ 同步 Key 池失败: {key_pool_error}"
+                self._status_label.setStyleSheet("color: #D69E2E; font-size: 12px;")
+                self._status_label.setText(msg)
+                self.account_added.emit(last_account)
+                return
             self._status_label.setText(msg)
             self._status_label.setStyleSheet("color: #38A169; font-size: 12px;")
             # 通知父页面 AccountsPage 刷新表格
@@ -1554,14 +1550,15 @@ class AccountsPage(QWidget):
         self.quota_updated.emit()  # 通知其他页面刷新
 
     def _check_all_status(self):
-        """检查所有账号的 API Key 状态（风控/失效），同步到上游 Key 池"""
+        """检查所有账号的凭证状态（风控/失效），ck_ 卡密与纯 JWT 账号都覆盖，同步到上游 Key 池和账号表"""
         from PySide6.QtCore import QThread, Signal as QSignal
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         self._load_accounts()
-        accounts_with_key = [a for a in self._accounts if a.api_key]
+        # ck_ 卡密或 JWT（auth_token）任一存在即可检测：裸 JWT 在 chat 端点同样可用（实测 200）
+        accounts_with_key = [a for a in self._accounts if a.api_key or a.auth_token]
         if not accounts_with_key:
-            QMessageBox.information(self, "提示", "没有配置 API Key 的账号，无需检测")
+            QMessageBox.information(self, "提示", "没有配置 API Key 或 Token 的账号，无需检测")
             return
 
         max_workers = self._concurrency_spin.value()
@@ -1577,9 +1574,10 @@ class AccountsPage(QWidget):
         self._append_log(f"🔍 开始检测 {len(accounts_with_key)} 个账号状态，并发数: {max_workers}")
 
         class StatusCheckWorker(QThread):
-            """后台并发检测 API Key 风控状态线程"""
+            """后台并发检测凭证（卡密/JWT）风控状态线程"""
             progress = QSignal(str, bool, str)  # nickname, success, status_text
-            done = QSignal(int, int, int, list, list, list)  # (正常, 异常, 失败, 异常key列表, 限流key列表, 正常key列表)
+            # (正常, 异常, 失败, 异常列表, 限流列表, 正常列表)；列表元素为 (凭证, uid)
+            done = QSignal(int, int, int, list, list, list)
 
             def __init__(self, accounts, max_workers=5):
                 super().__init__()
@@ -1591,9 +1589,14 @@ class AccountsPage(QWidget):
                 self._stop_flag = True
 
             def _check_one(self, acc):
-                api_key = acc.api_key
+                # 纯 Token 账号（无 ck_ 卡密）回退用 auth_token（与池同步同款回退）
+                api_key = acc.api_key or acc.auth_token
                 nickname = acc.nickname or acc.uid
                 try:
+                    # 纯 JWT 账号临期/过期先续期再检测，避免把可续期账号误判成限流
+                    if not acc.api_key and api_key.startswith("eyJ"):
+                        from ...modules.proxy_server import ensure_fresh_jwt
+                        api_key = ensure_fresh_jwt(acc)
                     result = check_api_key_chat_status(api_key, attempts=3)
                     return (
                         nickname,
@@ -1601,9 +1604,10 @@ class AccountsPage(QWidget):
                         result.get("status_text", "check_failed"),
                         api_key,
                         result.get("flag"),
+                        acc.uid,
                     )
                 except Exception as e:
-                    return (nickname, False, f"异常: {e}", api_key, None)
+                    return (nickname, False, f"异常: {e}", api_key, None, acc.uid)
 
             def run(self):
                 normal = 0
@@ -1620,17 +1624,19 @@ class AccountsPage(QWidget):
                             executor.shutdown(wait=False, cancel_futures=True)
                             break
                         try:
-                            nickname, success, status_text, api_key, flag = future.result()
+                            nickname, success, status_text, api_key, flag, uid = future.result()
                             self.progress.emit(nickname, success, status_text)
+                            # 列表元素为 (凭证, uid)：uid 用于写回账号表
+                            #（JWT 续期后凭证已换新，按凭证反查 uid 会丢，必须直接带回来）
                             if flag == "abnormal":
                                 abnormal += 1
-                                abnormal_keys.append(api_key)
+                                abnormal_keys.append((api_key, uid))
                             elif flag == "rate_limited":
                                 abnormal += 1
-                                rate_limited_keys.append(api_key)
+                                rate_limited_keys.append((api_key, uid))
                             elif success:
                                 normal += 1
-                                ok_keys.append(api_key)
+                                ok_keys.append((api_key, uid))
                             else:
                                 failed += 1
                         except Exception:
@@ -1652,20 +1658,22 @@ class AccountsPage(QWidget):
             self._btn_stop_query.setEnabled(True)
             self._progress_bar.setVisible(False)
 
-            # 同步到上游 Key 池
+            # 同步到上游 Key 池（按凭证字符串匹配池 key）
             try:
                 from ...modules.proxy_server import ProxyDatabase
+                abnormal_apis = {cred for cred, _ in abnormal_keys}
+                rate_limited_apis = {cred for cred, _ in rate_limited_keys}
                 proxy_db = ProxyDatabase.get_instance()
                 all_keys = proxy_db.get_upstream_keys()
                 for k in all_keys:
                     k_api = k.get("api_key", "")
                     k_id = k.get("key_id", "")
-                    if k_api in abnormal_keys and k.get("status") != "abnormal":
+                    if k_api in abnormal_apis and k.get("status") != "abnormal":
                         proxy_db.update_upstream_key(k_id, {"status": "abnormal"})
-                    elif k_api in rate_limited_keys and k.get("status") != "rate_limited":
+                    elif k_api in rate_limited_apis and k.get("status") != "rate_limited":
                         proxy_db.update_upstream_key(k_id, {"status": "rate_limited"})
-                    elif (k_api not in abnormal_keys
-                          and k_api not in rate_limited_keys
+                    elif (k_api not in abnormal_apis
+                          and k_api not in rate_limited_apis
                           and k.get("status") in ("abnormal", "rate_limited")):
                         # 之前异常/限流，本次检测通过 → 恢复 active
                         proxy_db.update_upstream_key(k_id, {"status": "active"})
@@ -1675,20 +1683,16 @@ class AccountsPage(QWidget):
             except Exception as e:
                 self._append_log(f"⚠️ 同步上游池失败: {e}")
 
-            # 检测结果写回账号表（状态列/按状态全选 依赖它）
+            # 检测结果写回账号表（状态列/按状态全选 依赖它；uid 由 worker 直接带回）
             try:
                 from ...utils.store import update_account_status
-                key_to_uid = {a.api_key: a.uid for a in accounts_with_key}
-                for api_key in abnormal_keys:
-                    uid = key_to_uid.get(api_key)
+                for _, uid in abnormal_keys:
                     if uid:
                         update_account_status(uid, AccountStatus.ERROR, "风控异常")
-                for api_key in rate_limited_keys:
-                    uid = key_to_uid.get(api_key)
+                for _, uid in rate_limited_keys:
                     if uid:
                         update_account_status(uid, AccountStatus.ERROR, "限流(401)")
-                for api_key in ok_keys:
-                    uid = key_to_uid.get(api_key)
+                for _, uid in ok_keys:
                     if uid:
                         update_account_status(uid, AccountStatus.ACTIVE, "")
                 self._load_accounts()
