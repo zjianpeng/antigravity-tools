@@ -1284,9 +1284,23 @@ class AccountsPage(QWidget):
             menu.addSeparator()
             action_copy_api = menu.addAction("📋 复制 API Key")
             action_copy_api.triggered.connect(lambda: self._copy_field(account.api_key, "API Key"))
+            action_copy_token = menu.addAction("📋 复制 Token")
+            action_copy_token.setEnabled(bool(account.auth_token))
+            action_copy_token.triggered.connect(lambda: self._copy_token(account))
             menu.addSeparator()
             action_export = menu.addAction("批量导出")
             action_export.triggered.connect(lambda: self._export_selected_accounts())
+            menu.addSeparator()
+            action_switch_cn = menu.addAction("🔀 切换 CodeBuddy CN 账号")
+            action_switch_cn.setEnabled(bool(account.auth_token))
+            action_switch_cn.triggered.connect(
+                lambda: self._switch_client_account(account, "codebuddy_cn")
+            )
+            action_switch_wb = menu.addAction("🔀 切换 WorkBuddy 账号")
+            action_switch_wb.setEnabled(bool(account.auth_token))
+            action_switch_wb.triggered.connect(
+                lambda: self._switch_client_account(account, "workbuddy")
+            )
             menu.addSeparator()
             action_del = menu.addAction("🗑️ 删除账号")
             action_del.triggered.connect(lambda: self._delete_account(account))
@@ -1298,6 +1312,54 @@ class AccountsPage(QWidget):
             action_batch.triggered.connect(lambda: self._batch_delete())
 
         menu.exec(QCursor.pos())
+
+    def _switch_client_account(self, account: Account, client: str):
+        """一键切号：把账号登录态写入 CodeBuddy CN / WorkBuddy 客户端并重启它"""
+        client_name = "CodeBuddy CN" if client == "codebuddy_cn" else "WorkBuddy"
+        ret = QMessageBox.question(
+            self,
+            "切换账号",
+            f"将把 {client_name} 客户端切换到账号「{account.display_name}」。\n\n"
+            f"操作会先退出正在运行的 {client_name}（未保存内容可能丢失），写入登录态后自动重启。\n\n"
+            "确定继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        from PySide6.QtCore import QThread, Signal as QSignal
+
+        class SwitchThread(QThread):
+            result_ready = QSignal(bool, str)
+
+            def __init__(self, acc, which):
+                super().__init__()
+                self._acc = acc
+                self._which = which
+
+            def run(self):
+                from ...modules import account_switch
+
+                try:
+                    if self._which == "codebuddy_cn":
+                        msg = account_switch.switch_to_codebuddy_cn(self._acc)
+                    else:
+                        msg = account_switch.switch_to_workbuddy(self._acc)
+                    self.result_ready.emit(True, msg)
+                except Exception as exc:
+                    self.result_ready.emit(False, str(exc))
+
+        def _on_result(ok: bool, msg: str):
+            if ok:
+                QMessageBox.information(self, "切换成功", msg)
+            else:
+                QMessageBox.warning(self, "切换失败", msg)
+
+        thread = SwitchThread(account, client)
+        thread.result_ready.connect(_on_result)
+        thread.start()
+        self._switch_thread = thread  # 防 GC
 
     def _show_credits_detail(self, account: Account):
         """显示积分明细弹窗"""
@@ -1723,6 +1785,26 @@ class AccountsPage(QWidget):
             return
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(value)
+
+    def _copy_token(self, account: Account):
+        """按 Token 导入格式复制账号的最新凭证：昵称----accessToken----refreshToken。
+
+        取的是软件里当前最新的 token（JWT 自动续期后已是新值），
+        无 refreshToken 时退化为两段：昵称----accessToken。
+        """
+        access_token, refresh_token = account.auth_token, ""
+        if account.auth_raw:
+            try:
+                raw = json.loads(account.auth_raw)
+                access_token = raw.get("accessToken") or raw.get("access_token") or access_token
+                refresh_token = raw.get("refreshToken") or raw.get("refresh_token") or ""
+            except Exception:
+                pass
+        if not access_token:
+            return
+        nickname = account.nickname or account.uid or ""
+        text = f"{nickname}----{access_token}----{refresh_token}" if refresh_token else f"{nickname}----{access_token}"
+        self._copy_field(text, "Token")
 
     def _export_selected_accounts(self):
         selected = self._get_selected_accounts()

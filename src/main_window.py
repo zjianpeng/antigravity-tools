@@ -30,7 +30,7 @@ def get_current_version() -> str:
                 return f.read().strip()
         except Exception:
             pass
-    return "2.1.0"
+    return "2.2.0"
 
 
 class MainWindow(QMainWindow):
