@@ -469,6 +469,11 @@ class CodeBuddyRelayServer:
                         except Exception as e:
                             logger.error(f"[CodeBuddy中转] 统计写入失败: {e}")
                         server_ref._set_current_key(_key)
+                        # 调用完成后异步查分刷新积分（内部 5 分钟限频，照 API 代理）
+                        try:
+                            server_ref.db.refresh_key_points_if_needed(_kid)
+                        except Exception:
+                            pass
 
                     server_ref._inflight_inc(key_id)
                     result = self._do_forward(

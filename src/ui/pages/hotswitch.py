@@ -591,6 +591,17 @@ class HotSwitchPage(QWidget):
         elif idx == 1:
             self._refresh_log()
 
+    def _fresh_points(self, cur: dict) -> str:
+        """当前消耗 Key 的积分从 DB 实时取（_set_current_key 里是选 Key 时的旧快照）"""
+        fallback = cur.get("points") or "?"
+        kid = cur.get("key_id", "")
+        if not kid:
+            return fallback
+        for k in self._jwt_keys():
+            if k.get("key_id") == kid:
+                return k.get("points") or fallback
+        return fallback
+
     def _refresh_status(self):
         """刷新中转运行状态"""
         running = self._relay_server and self._relay_server.is_running
@@ -605,7 +616,7 @@ class HotSwitchPage(QWidget):
             self._port_spin.setEnabled(False)
             self._listen_mode_combo.setEnabled(False)
             if cur:
-                points = cur.get("points") or "?"
+                points = self._fresh_points(cur)
                 consume = f"当前消耗: {cur.get('label', '-')}（剩余 {points} 分）"
             else:
                 consume = "当前消耗: -（等待客户端发起对话）"
@@ -1289,7 +1300,7 @@ class HotSwitchPage(QWidget):
         cur = st.get("current_key") or {}
         header = ""
         if cur:
-            header = f"当前消耗: {cur.get('label', '-')}（剩余 {cur.get('points') or '?'} 分）\n"
+            header = f"当前消耗: {cur.get('label', '-')}（剩余 {self._fresh_points(cur)} 分）\n"
         header += f"累计请求 {st['total_requests']} 次（换号 {st['swapped_requests']} 次）\n"
         header += "─" * 40
         self._log_edit.setPlainText(
