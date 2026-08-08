@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QLineEdit,
     QDialog, QFormLayout, QTextEdit, QFileDialog, QMessageBox,
-    QMenu, QSizePolicy, QAbstractItemView, QSpinBox, QProgressBar
+    QMenu, QSizePolicy, QAbstractItemView, QSpinBox, QProgressBar,
+    QTreeWidget, QTreeWidgetItem
 )
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QAction, QCursor
@@ -836,6 +837,186 @@ class CreditsDetailDialog(QDialog):
             return cycle_end
 
 
+class SessionRestoreDialog(QDialog):
+    """WorkBuddy 按对话恢复：列出本地全部历史对话，勾选后恢复到当前登录账号名下。
+
+    场景：微信重登/换号后生成了新 uid，旧账号的对话在 UI 不可见（数据没丢，
+    只是 sessions.user_id 隔离）。按对话粒度精准改归属，比整账号迁移更灵活。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("💬 恢复 WorkBuddy 历史对话")
+        self.resize(660, 540)
+        self._restore_thread = None
+        self._setup_ui()
+        self._load_sessions()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        from ...modules import account_switch
+
+        self._current_uid = account_switch.read_current_workbuddy_uid()
+        cur_text = f"{self._current_uid[:8]}…" if self._current_uid else "未识别（请先在 WorkBuddy 登录）"
+        info = QLabel(
+            f"把选中的对话恢复到当前登录账号（{cur_text}）名下；"
+            "操作前自动备份数据库，恢复后需重启 WorkBuddy 客户端可见。"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self._tree = QTreeWidget(self)
+        self._tree.setHeaderLabels(["对话", "最后活跃"])
+        self._tree.setColumnWidth(0, 440)
+        layout.addWidget(self._tree)
+
+        btn_row = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_all.setObjectName("secondary_btn")
+        btn_all.clicked.connect(lambda: self._set_all(Qt.Checked))
+        btn_row.addWidget(btn_all)
+        btn_none = QPushButton("全不选")
+        btn_none.setObjectName("secondary_btn")
+        btn_none.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        self._btn_restore = QPushButton("✅ 恢复选中对话")
+        self._btn_restore.setObjectName("primary_btn")
+        self._btn_restore.setCursor(Qt.PointingHandCursor)
+        self._btn_restore.clicked.connect(self._restore_selected)
+        btn_row.addWidget(self._btn_restore)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.reject)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+    def _load_sessions(self):
+        from ...modules import account_switch
+
+        sessions = account_switch.list_workbuddy_sessions()
+        # 按账号分组；当前账号的对话本就在名下，无需恢复，不列出
+        groups = {}
+        for s in sessions:
+            if s["user_id"] == self._current_uid:
+                continue
+            groups.setdefault(s["user_id"], []).append(s)
+
+        self._tree.clear()
+        if not groups:
+            item = QTreeWidgetItem(["没有其他账号的历史对话", ""])
+            item.setFlags(Qt.NoItemFlags)
+            self._tree.addTopLevelItem(item)
+            self._btn_restore.setEnabled(False)
+            return
+
+        for uid, items in groups.items():
+            top = QTreeWidgetItem([f"账号 {uid[:8]}…（{len(items)} 条对话）", ""])
+            top.setFlags(top.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
+            top.setCheckState(0, Qt.Unchecked)
+            self._tree.addTopLevelItem(top)
+            for s in items:
+                ts = s.get("updated_at") or 0
+                try:
+                    time_str = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = "-"
+                title = s["title"] if len(s["title"]) <= 50 else s["title"][:47] + "..."
+                child = QTreeWidgetItem([title, time_str])
+                child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.Unchecked)
+                child.setData(0, Qt.UserRole, s["id"])
+                top.addChild(child)
+            top.setExpanded(True)
+
+    def _set_all(self, state):
+        for i in range(self._tree.topLevelItemCount()):
+            self._tree.topLevelItem(i).setCheckState(0, state)
+
+    def _selected_session_ids(self) -> list:
+        ids = []
+        for i in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child.checkState(0) == Qt.Checked:
+                    sid = child.data(0, Qt.UserRole)
+                    if sid:
+                        ids.append(sid)
+        return ids
+
+    def _restore_selected(self):
+        ids = self._selected_session_ids()
+        if not ids:
+            QMessageBox.information(self, "提示", "请先勾选要恢复的对话")
+            return
+        if not self._current_uid:
+            QMessageBox.warning(self, "提示", "未识别到当前登录的 WorkBuddy 账号，请先在客户端登录")
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "恢复对话",
+            f"将把选中的 {len(ids)} 条对话恢复到当前账号名下。\n\n"
+            "操作前会自动备份数据库。确定继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        from PySide6.QtCore import QThread, Signal as QSignal
+
+        class RestoreThread(QThread):
+            result_ready = QSignal(bool, str)
+
+            def __init__(self, session_ids, uid):
+                super().__init__()
+                self._ids = session_ids
+                self._uid = uid
+
+            def run(self):
+                from ...modules import account_switch
+
+                try:
+                    msg = account_switch.restore_workbuddy_sessions(self._ids, self._uid)
+                    self.result_ready.emit(True, msg)
+                except Exception as exc:
+                    self.result_ready.emit(False, str(exc))
+
+        def _on_result(ok: bool, msg: str):
+            self._btn_restore.setEnabled(True)
+            if ok:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle("恢复成功")
+                box.setText(msg + "\n\n重启 WorkBuddy 客户端后即可在对话列表看到。")
+                box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                backup_path = ""
+                for line in msg.splitlines():
+                    if line.startswith("备份目录："):
+                        backup_path = line.split("：", 1)[1].strip()
+                copy_btn = None
+                if backup_path:
+                    copy_btn = box.addButton("📋 复制备份路径", QMessageBox.ActionRole)
+                box.addButton(QMessageBox.Ok)
+                box.exec()
+                if copy_btn is not None and box.clickedButton() is copy_btn:
+                    from PySide6.QtWidgets import QApplication
+
+                    QApplication.clipboard().setText(backup_path)
+                self._load_sessions()  # 刷新列表（已恢复的不再出现）
+            else:
+                QMessageBox.warning(self, "恢复失败", msg)
+
+        self._btn_restore.setEnabled(False)
+        thread = RestoreThread(ids, self._current_uid)
+        thread.result_ready.connect(_on_result)
+        thread.start()
+        self._restore_thread = thread  # 防 GC
+
+
 class AccountsPage(QWidget):
     """账号管理页面"""
 
@@ -931,6 +1112,15 @@ class AccountsPage(QWidget):
         btn_import.setCursor(Qt.PointingHandCursor)
         btn_import.clicked.connect(self._import_batch)
         toolbar.addWidget(btn_import)
+
+        btn_restore_sessions = QPushButton("💬 恢复对话")
+        btn_restore_sessions.setObjectName("secondary_btn")
+        btn_restore_sessions.setCursor(Qt.PointingHandCursor)
+        btn_restore_sessions.setToolTip(
+            "WorkBuddy 换号后对话不见了？按对话勾选恢复到当前账号（自动备份）"
+        )
+        btn_restore_sessions.clicked.connect(self._open_session_restore)
+        toolbar.addWidget(btn_restore_sessions)
 
         # 并发数设置
         toolbar.addWidget(QLabel("并发:"))
@@ -1301,6 +1491,9 @@ class AccountsPage(QWidget):
             action_switch_wb.triggered.connect(
                 lambda: self._switch_client_account(account, "workbuddy")
             )
+            action_copy_inject = menu.addAction("📋 复制网页注入脚本")
+            action_copy_inject.setEnabled(bool(account.auth_token))
+            action_copy_inject.triggered.connect(lambda: self._copy_inject_script(account))
             menu.addSeparator()
             action_del = menu.addAction("🗑️ 删除账号")
             action_del.triggered.connect(lambda: self._delete_account(account))
@@ -1316,27 +1509,38 @@ class AccountsPage(QWidget):
     def _switch_client_account(self, account: Account, client: str):
         """一键切号：把账号登录态写入 CodeBuddy CN / WorkBuddy 客户端并重启它"""
         client_name = "CodeBuddy CN" if client == "codebuddy_cn" else "WorkBuddy"
-        ret = QMessageBox.question(
-            self,
-            "切换账号",
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("切换账号")
+        box.setText(
             f"将把 {client_name} 客户端切换到账号「{account.display_name}」。\n\n"
             f"操作会先退出正在运行的 {client_name}（未保存内容可能丢失），写入登录态后自动重启。\n\n"
-            "确定继续吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "确定继续吗？"
         )
-        if ret != QMessageBox.Yes:
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        keep_cb = None
+        if client == "workbuddy":
+            from PySide6.QtWidgets import QCheckBox
+
+            keep_cb = QCheckBox("保留当前账号的对话记录（跟随迁移到新账号，自动备份）", box)
+            keep_cb.setChecked(True)
+            box.setCheckBox(keep_cb)
+        box.exec()
+        if box.standardButton(box.clickedButton()) != QMessageBox.Yes:
             return
+        keep_sessions = bool(keep_cb and keep_cb.isChecked())
 
         from PySide6.QtCore import QThread, Signal as QSignal
 
         class SwitchThread(QThread):
             result_ready = QSignal(bool, str)
 
-            def __init__(self, acc, which):
+            def __init__(self, acc, which, keep):
                 super().__init__()
                 self._acc = acc
                 self._which = which
+                self._keep = keep
 
             def run(self):
                 from ...modules import account_switch
@@ -1345,21 +1549,58 @@ class AccountsPage(QWidget):
                     if self._which == "codebuddy_cn":
                         msg = account_switch.switch_to_codebuddy_cn(self._acc)
                     else:
-                        msg = account_switch.switch_to_workbuddy(self._acc)
+                        msg = account_switch.switch_to_workbuddy(self._acc, keep_sessions=self._keep)
                     self.result_ready.emit(True, msg)
                 except Exception as exc:
                     self.result_ready.emit(False, str(exc))
 
         def _on_result(ok: bool, msg: str):
             if ok:
-                QMessageBox.information(self, "切换成功", msg)
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle("切换成功")
+                box.setText(msg)
+                box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                backup_path = ""
+                for line in msg.splitlines():
+                    if line.startswith("备份目录："):
+                        backup_path = line.split("：", 1)[1].strip()
+                copy_btn = None
+                if backup_path:
+                    copy_btn = box.addButton("📋 复制备份路径", QMessageBox.ActionRole)
+                box.addButton(QMessageBox.Ok)
+                box.exec()
+                if copy_btn is not None and box.clickedButton() is copy_btn:
+                    self._copy_field(backup_path, "备份路径")
             else:
                 QMessageBox.warning(self, "切换失败", msg)
 
-        thread = SwitchThread(account, client)
+        thread = SwitchThread(account, client, keep_sessions)
         thread.result_ready.connect(_on_result)
         thread.start()
         self._switch_thread = thread  # 防 GC
+
+    def _open_session_restore(self):
+        """打开「按对话恢复」弹窗（WorkBuddy 历史对话挑选恢复）"""
+        SessionRestoreDialog(self).exec()
+
+    def _copy_inject_script(self, account: Account):
+        """复制网页端注入脚本：在 workbuddy.cn / codebuddy.cn 页面按 F12 →
+        控制台粘贴回车，页面即使用该账号（无需验证码；刷新页面后失效）。"""
+        # 取软件里当前最新的 accessToken（与 _copy_token 同逻辑）
+        access_token = account.auth_token
+        if account.auth_raw:
+            try:
+                raw = json.loads(account.auth_raw)
+                access_token = raw.get("accessToken") or raw.get("access_token") or access_token
+            except Exception:
+                pass
+        if not access_token:
+            return
+
+        from ...modules import browser_inject
+
+        self._copy_field(browser_inject.build_inject_js(access_token), "网页注入脚本")
 
     def _show_credits_detail(self, account: Account):
         """显示积分明细弹窗"""

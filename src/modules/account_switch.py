@@ -96,6 +96,230 @@ def workbuddy_auth_file() -> Path:
     return base / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "workbuddy-desktop.info"
 
 
+def workbuddy_data_dir() -> Path:
+    """WorkBuddy 客户端数据根目录（workbuddy.db / memory/ / connectors/ 所在）。"""
+    if _is_windows():
+        return Path(os.environ.get("USERPROFILE", "")) / ".workbuddy"
+    return Path.home() / ".workbuddy"
+
+
+def read_current_workbuddy_uid() -> str:
+    """从当前 WorkBuddy 登录态文件读 account.uid（切号前的旧账号 user_id）。"""
+    try:
+        data = json.loads(workbuddy_auth_file().read_text(encoding="utf-8"))
+        return (data.get("account") or {}).get("uid") or ""
+    except Exception:
+        return ""
+
+
+def migrate_workbuddy_user_data(old_uid: str, new_uid: str, data_dir: Path | None = None) -> str:
+    """无感换号：把旧账号的对话/记忆/连接器迁移到新账号名下。
+
+    原理（本机实测核对，2026-08-08）：WorkBuddy 按 user_id 做账号隔离——
+    - sessions:  workbuddy.db sessions.user_id
+    - 长期记忆:  memory/{uid}_memory.md
+    - 连接器:    connectors/{uid}/
+    数据没丢，只是新账号 UI 看不到。这里把归属改到新 uid。
+
+    安全措施：
+    - 迁移前整体备份到 data_dir/antigravity-switch-backups/{时间戳}_{old_uid前8位}/
+    - 只复制/追加/UPDATE，不删除旧账号任何文件
+    - 迁移前后 WAL checkpoint，改完验证旧 uid 的 sessions 归零
+    必须在 WorkBuddy 客户端退出后调用（DB 不被占用）。
+    """
+    if not old_uid or not new_uid or old_uid == new_uid:
+        return ""
+    data_dir = data_dir or workbuddy_data_dir()
+    if not data_dir.is_dir():
+        return ""
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = data_dir / "antigravity-switch-backups" / f"{ts}_{old_uid[:8]}"
+    n = 1
+    while backup_dir.exists():  # 同一秒内重复迁移同一账号时避免撞目录
+        n += 1
+        backup_dir = data_dir / "antigravity-switch-backups" / f"{ts}_{old_uid[:8]}_{n}"
+    backup_dir.mkdir(parents=True)
+    (backup_dir / "meta.json").write_text(
+        json.dumps(
+            {"old_uid": old_uid, "new_uid": new_uid, "time": ts},
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    summary = []
+
+    # 1) sessions 对话记录
+    db_path = data_dir / "workbuddy.db"
+    if db_path.is_file():
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            shutil.copy2(db_path, backup_dir / "workbuddy.db")
+            cur = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE user_id = ?",
+                (new_uid, old_uid),
+            )
+            moved = cur.rowcount
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            left = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (old_uid,)
+            ).fetchone()[0]
+            if left != 0:
+                raise SwitchError(f"对话迁移后旧账号仍剩 {left} 条，已中止（备份在 {backup_dir}）")
+            summary.append(f"对话 {moved} 条")
+        finally:
+            conn.close()
+
+    # 2) 长期记忆（追加去重，不动旧文件）
+    old_mem = data_dir / "memory" / f"{old_uid}_memory.md"
+    new_mem = data_dir / "memory" / f"{new_uid}_memory.md"
+    if old_mem.is_file():
+        shutil.copy2(old_mem, backup_dir / old_mem.name)
+        old_lines = old_mem.read_text(encoding="utf-8", errors="replace").splitlines()
+        if new_mem.is_file():
+            shutil.copy2(new_mem, backup_dir / new_mem.name)
+            existing = set(new_mem.read_text(encoding="utf-8", errors="replace").splitlines())
+            add = [ln for ln in old_lines if ln.strip() and ln not in existing]
+            if add:
+                with new_mem.open("a", encoding="utf-8") as f:
+                    f.write(f"\n\n---\n> 以下迁移自旧账号 {old_uid[:8]}（{ts}）\n")
+                    f.write("\n".join(add) + "\n")
+                summary.append(f"记忆追加 {len(add)} 行")
+        else:
+            new_mem.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old_mem, new_mem)
+            summary.append("记忆已复制")
+
+    # 3) MCP 连接器（JSON 深度合并，新账号已有配置优先；不删旧目录）
+    old_conn = data_dir / "connectors" / old_uid
+    new_conn = data_dir / "connectors" / new_uid
+    if old_conn.is_dir():
+        shutil.copytree(old_conn, backup_dir / f"connectors_{old_uid[:8]}")
+        if not new_conn.is_dir():
+            shutil.copytree(old_conn, new_conn)
+            summary.append("连接器已复制")
+        else:
+            merged = 0
+            for src in old_conn.rglob("*"):
+                if not src.is_file():
+                    continue
+                dst = new_conn / src.relative_to(old_conn)
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    merged += 1
+                elif src.suffix == ".json":
+                    try:
+                        old_j = json.loads(src.read_text(encoding="utf-8"))
+                        new_j = json.loads(dst.read_text(encoding="utf-8"))
+                        if isinstance(old_j, dict) and isinstance(new_j, dict):
+                            for k, v in old_j.items():
+                                new_j.setdefault(k, v)  # 新账号已有配置不动
+                            dst.write_text(
+                                json.dumps(new_j, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            merged += 1
+                    except Exception:
+                        logger.warning("连接器合并跳过（JSON 解析失败）: %s", src)
+            if merged:
+                summary.append(f"连接器合并 {merged} 项")
+
+    logger.info("workbuddy 数据迁移完成 %s -> %s: %s（备份 %s）", old_uid, new_uid, summary, backup_dir)
+    tail = "、".join(summary) if summary else "旧账号无可迁移数据"
+    return f"{tail}\n备份目录：{backup_dir}"
+
+
+def list_workbuddy_sessions(data_dir: Path | None = None) -> list:
+    """列出本地全部未删除的 WorkBuddy 对话（只读），供「按对话恢复」挑选。
+
+    返回 [{id, user_id, title, updated_at, created_at}]，按 updated_at 倒序。
+    title 取 custom_title 优先，其次 title，都没有则为 "（无标题）"。
+    """
+    data_dir = data_dir or workbuddy_data_dir()
+    db_path = data_dir / "workbuddy.db"
+    if not db_path.is_file():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = conn.execute(
+            "SELECT id, user_id, title, custom_title, created_at, updated_at "
+            "FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": r[0],
+            "user_id": r[1],
+            "title": (r[3] or r[2] or "（无标题）").strip() or "（无标题）",
+            "created_at": r[4],
+            "updated_at": r[5],
+        }
+        for r in rows
+    ]
+
+
+def restore_workbuddy_sessions(
+    session_ids: list, target_uid: str, data_dir: Path | None = None
+) -> str:
+    """按对话恢复：把选中的若干条对话改归 target_uid 名下（精准 UPDATE，不动其他对话）。
+
+    与 migrate_workbuddy_user_data 同一套安全流程：备份 DB → UPDATE → WAL checkpoint → 验证。
+    WorkBuddy 客户端有会话列表缓存，恢复后需重启客户端才能在 UI 看到。
+    """
+    session_ids = [s for s in session_ids if s]
+    if not session_ids or not target_uid:
+        raise SwitchError("参数为空：未选择对话或未识别到当前账号")
+    data_dir = data_dir or workbuddy_data_dir()
+    db_path = data_dir / "workbuddy.db"
+    if not db_path.is_file():
+        raise SwitchError(f"未找到 WorkBuddy 数据库：{db_path}")
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = data_dir / "antigravity-switch-backups" / f"{ts}_restore_{target_uid[:8]}"
+    n = 1
+    while backup_dir.exists():  # 同一秒内重复执行时避免撞目录
+        n += 1
+        backup_dir = data_dir / "antigravity-switch-backups" / f"{ts}_restore_{target_uid[:8]}_{n}"
+    backup_dir.mkdir(parents=True)
+    (backup_dir / "meta.json").write_text(
+        json.dumps(
+            {"type": "restore_sessions", "target_uid": target_uid,
+             "session_ids": session_ids, "time": ts},
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    placeholders = ",".join("?" for _ in session_ids)
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        shutil.copy2(db_path, backup_dir / "workbuddy.db")
+        cur = conn.execute(
+            f"UPDATE sessions SET user_id = ? WHERE id IN ({placeholders})",
+            [target_uid, *session_ids],
+        )
+        moved = cur.rowcount
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        left = conn.execute(
+            f"SELECT COUNT(*) FROM sessions WHERE id IN ({placeholders}) AND user_id != ?",
+            [*session_ids, target_uid],
+        ).fetchone()[0]
+        if left != 0:
+            raise SwitchError(f"恢复后仍有 {left} 条对话未归属当前账号，已中止（备份在 {backup_dir}）")
+    finally:
+        conn.close()
+
+    logger.info("workbuddy 按对话恢复完成: %s 条 -> %s（备份 %s）", moved, target_uid, backup_dir)
+    return f"对话 {moved} 条已恢复到当前账号\n备份目录：{backup_dir}"
+
+
 def codebuddy_cn_app_candidates() -> list:
     if _is_macos():
         return [
@@ -623,13 +847,21 @@ def build_workbuddy_auth_json(account: Account) -> dict:
     return {"account": account_obj, "auth": auth_obj, "accounts": [account_obj]}
 
 
-def switch_to_workbuddy(account: Account) -> str:
-    """把 account 的登录态写入 WorkBuddy 客户端并重启它。返回成功提示文案。"""
+def switch_to_workbuddy(account: Account, keep_sessions: bool = False) -> str:
+    """把 account 的登录态写入 WorkBuddy 客户端并重启它。返回成功提示文案。
+
+    keep_sessions=True 时（无感换号）：切号前记录当前账号 uid，写入新登录态后
+    把旧账号的对话/记忆/连接器迁移到新账号名下（先自动备份）。
+    """
     if not (_is_macos() or _is_windows()):
         raise SwitchError("切换 WorkBuddy 账号目前支持 macOS / Windows")
 
     _refresh_if_stale(account)
     payload = build_workbuddy_auth_json(account)
+
+    # 切号前记录旧账号 uid（覆盖 auth 文件之前）
+    old_uid = read_current_workbuddy_uid() if keep_sessions else ""
+    new_uid = payload["account"].get("uid") or ""
 
     app_root = _find_app_bundle(workbuddy_app_candidates())
     if not app_root:
@@ -671,5 +903,13 @@ def switch_to_workbuddy(account: Account) -> str:
     if written.get("auth", {}).get("accessToken") != payload["auth"]["accessToken"]:
         raise SwitchError("写入后回读校验失败：accessToken 不一致")
 
+    # 无感换号：客户端已退出，趁 DB 空闲迁移旧账号数据归属
+    migrate_msg = ""
+    if keep_sessions and old_uid and new_uid and old_uid != new_uid:
+        migrate_msg = migrate_workbuddy_user_data(old_uid, new_uid)
+
     _start_app_bundle(app_root)
-    return f"已切换 WorkBuddy 到账号「{account.display_name}」，客户端已重启"
+    msg = f"已切换 WorkBuddy 到账号「{account.display_name}」，客户端已重启"
+    if migrate_msg:
+        msg += f"\n\n对话记录已跟随：{migrate_msg}"
+    return msg

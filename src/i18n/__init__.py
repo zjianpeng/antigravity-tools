@@ -17,6 +17,7 @@ _zh_cn = {
     "nav.checkin": "每日签到",
     "nav.quota": "配额监控",
     "nav.api_proxy": "API 代理",
+    "nav.hotswitch": "无感换号",
     "nav.changelog": "更新日志",
     "nav.settings": "设置",
 
@@ -133,6 +134,7 @@ _en = {
     "nav.checkin": "Check In",
     "nav.quota": "Quota",
     "nav.api_proxy": "API Proxy",
+    "nav.hotswitch": "Seamless Switch",
     "nav.changelog": "Changelog",
     "nav.settings": "Settings",
     "common.add": "Add",

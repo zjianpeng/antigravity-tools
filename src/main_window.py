@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QSize
 from .ui import Sidebar, get_stylesheet
 from .ui.pages import (
     DashboardPage, AccountsPage, CheckinPage,
-    SettingsPage, ApiProxyPage, ChangelogPage,
+    SettingsPage, ApiProxyPage, HotSwitchPage, ChangelogPage,
 )
 from .i18n import t
 from .utils.store import init_db, load_setting
@@ -30,7 +30,7 @@ def get_current_version() -> str:
                 return f.read().strip()
         except Exception:
             pass
-    return "2.2.0"
+    return "2.3.0"
 
 
 class MainWindow(QMainWindow):
@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
             "accounts": AccountsPage(),
             "checkin": CheckinPage(),
             "api_proxy": ApiProxyPage(),
+            "hotswitch": HotSwitchPage(),
             "changelog": ChangelogPage(),
             "settings": SettingsPage(),
         }

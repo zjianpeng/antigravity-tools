@@ -1665,6 +1665,33 @@ class ProxyDatabase:
         with self._lock:
             return dict(self._data.get("daily_stats", {}).get(category, {}).get(key_id, {}).get(today, {}))
 
+    def increment_relay_key_stats(self, key_id: str, prompt_tokens: int = 0,
+                                   completion_tokens: int = 0, total_tokens: int = 0,
+                                   cached_tokens: int = 0):
+        """无感换号专用统计（在 DB 锁内原子递增）。
+
+        只写 relay_* 字段与 daily_stats["relay"] 分类，
+        与 API 代理的 used_count / daily_stats["upstream"] 完全隔离。
+        """
+        with self._lock:
+            keys = self._data.setdefault("upstream_keys", [])
+            for k in keys:
+                if k.get("key_id") == key_id:
+                    k["relay_used"] = int(k.get("relay_used", 0) or 0) + 1
+                    k["last_used_at"] = datetime.now().isoformat()
+                    if prompt_tokens:
+                        k["relay_prompt_tokens"] = int(k.get("relay_prompt_tokens", 0) or 0) + prompt_tokens
+                    if completion_tokens:
+                        k["relay_completion_tokens"] = int(k.get("relay_completion_tokens", 0) or 0) + completion_tokens
+                    if total_tokens:
+                        k["relay_total_tokens"] = int(k.get("relay_total_tokens", 0) or 0) + total_tokens
+                    if cached_tokens:
+                        k["relay_cached_tokens"] = int(k.get("relay_cached_tokens", 0) or 0) + cached_tokens
+                    break
+            self._update_daily_stats("relay", key_id, prompt_tokens,
+                                     completion_tokens, total_tokens, cached_tokens, 0.0)
+            self._save()
+
     def get_usage_summary(self, days: int = None) -> dict:
         """获取使用情况汇总统计
 
